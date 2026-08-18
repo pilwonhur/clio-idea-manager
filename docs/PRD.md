@@ -633,7 +633,7 @@ Clio 스킬이 호출할 수 있는 명령의 계약이다. 모든 명령은 JSO
 
 ## 12. 구현 단계
 
-구현체: `clio-idea-manager/`. 설치는 `./install.sh`, 테스트는 `python3 tests/test_clio.py`.
+구현체: `clio-idea-manager/`. 설치와 업데이트는 모두 `./install.sh`(최신을 받아 적용하려면 `./update.sh`), 테스트는 `python3 tests/test_clio.py`. 업데이트는 기존 설치를 지우지 않고 바뀐 파일만 제자리에서 갱신하며, `~/ClioData`와 사용자가 고친 `config.json` 값은 보존한다 (새로 생긴 설정 키만 기본값으로 채운다).
 
 | 단계 | 범위 | 완료 기준 |
 |---|---|---|

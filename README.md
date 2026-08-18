@@ -6,11 +6,11 @@ Discord·Telegram·WhatsApp 같은 메신저로 던진 한 문장이 대화 로�
 지시어 하나로 원문을 그대로 데이터베이스에 커밋하고, 그 뒤에 분류·정제·연결을 이어붙인다.
 판단은 LLM이 하고 저장은 결정론적 CLI 도구가 한다. 외부 의존성은 없다.
 
-[![version](https://img.shields.io/badge/version-1.1.0-informational)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.2.0-informational)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![dependencies](https://img.shields.io/badge/dependencies-none-success)](#요구사항)
 [![storage](https://img.shields.io/badge/storage-SQLite%20%2B%20FTS5-003B57?logo=sqlite&logoColor=white)](#8-데이터-모델)
-[![tests](https://img.shields.io/badge/tests-28%20passing-brightgreen)](#15-테스트)
+[![tests](https://img.shields.io/badge/tests-29%20passing-brightgreen)](#15-테스트)
 [![license](https://img.shields.io/badge/license-MIT-blue)](#20-라이선스)
 
 > Claude Code / Claude Agent Skill 형식으로 배포된다. 스킬을 설치하지 않고
@@ -195,21 +195,99 @@ cd clio-idea-manager
 
 `install.sh`는 다음을 수행한다.
 
-1. 스킬 코드를 `~/.claude/skills/clio-idea-manager/`로 복사하고 실행 권한을 준다.
-2. 데이터 디렉터리 `~/ClioData/`를 만들고, **없을 때만** `config.json`을 생성한다.
+1. 스킬 코드를 `~/.claude/skills/clio-idea-manager/`에 넣고 실행 권한을 준다.
+2. 데이터 디렉터리 `~/ClioData/`를 만들고 `config.json`을 준비한다.
 3. 스키마를 생성(`idea_check init`, 멱등)하고 무결성 검사를 돌려 결과를 출력한다.
 
 ```
+== Clio 스킬 설치: 1.2.0 ==
 스킬  : /Users/you/.claude/skills/clio-idea-manager
-데이터: /Users/you/ClioData
+데이터: /Users/you/ClioData  (건드리지 않음)
+
+파일: 추가 12 · 갱신 0 · 유지 0 · 삭제 0
 config.json 생성 (자동 연결은 초기 비활성 — PRD D1)
-데이터베이스를 새로 만들었습니다.
+데이터베이스를 새로 만들었습니다. (스키마 v1)
 무결성: 이상 없음
-설치 완료. 데이터베이스: /Users/you/ClioData/ideas.db
+
+설치 완료 — clio-idea-manager 1.2.0
+데이터베이스: /Users/you/ClioData/ideas.db
 ```
 
-**스킬 코드와 데이터는 물리적으로 분리되어 있다.** 스킬을 몇 번을 재설치·업데이트해도
-`~/ClioData/`는 건드리지 않는다. `config.json`도 이미 있으면 유지한다.
+**스킬 코드와 데이터는 물리적으로 분리되어 있다.** 스킬을 몇 번을 다시 설치하거나
+업데이트해도 `~/ClioData/`는 건드리지 않는다.
+
+### 업데이트
+
+**지우고 다시 설치하지 않는다.** 같은 명령이 첫 설치와 업데이트를 모두 처리하며,
+바뀐 파일만 제자리에서 갱신한다.
+
+```bash
+cd clio-idea-manager
+./update.sh              # git pull --ff-only → install.sh
+```
+
+`git clone`이 아니라 압축본으로 받았다면 새 사본에서 `./install.sh`를 실행하면 된다.
+기존 설치 디렉터리를 미리 지울 필요가 없다.
+
+```bash
+cd ~/Downloads/clio-idea-manager-new
+./install.sh             # 기존 설치를 알아서 찾아 갱신한다
+```
+
+실행하면 무엇이 바뀌었는지 건수로 보고한다.
+
+```
+== Clio 스킬 업데이트: 1.1.0 → 1.2.0 ==
+스킬  : /Users/you/.claude/skills/clio-idea-manager
+데이터: /Users/you/ClioData  (건드리지 않음)
+
+이전 버전 보관: /Users/you/.claude/skills/clio-idea-manager.prev
+파일: 추가 0 · 갱신 3 · 유지 9 · 삭제 0
+config.json 유지 (변경 없음)
+기존 데이터베이스를 그대로 사용합니다. (스키마 v1)
+무결성: 이상 없음
+
+업데이트 완료 — clio-idea-manager 1.2.0
+변경 내용: /Users/you/.claude/skills/clio-idea-manager/CHANGELOG.md
+```
+
+업데이트가 보장하는 것은 다음과 같다.
+
+| 항목 | 처리 |
+|---|---|
+| `~/ClioData/ideas.db`, `attachments/`, `backups/` | **손대지 않는다** |
+| `config.json`의 사용자 수정값 | **그대로 유지한다** (임계값·경로 등) |
+| 새 버전에서 추가된 설정 키 | 기본값으로 **채워 넣는다** — 없던 키만 |
+| 바뀐 스킬 파일 | 덮어쓴다 |
+| 이전 버전에만 있던 파일 | 지운다 (낡은 스크립트가 남아 오작동하지 않도록) |
+| 직전 스킬 코드 | `<스킬 경로>.prev`에 한 세대 보관한다 |
+| 스키마 | `idea_check init`이 멱등하게 보장하고, 끝나면 무결성을 검사한다 |
+
+설치된 버전은 언제든 확인할 수 있다.
+
+```bash
+~/.claude/skills/clio-idea-manager/scripts/idea_check --version    # clio-idea-manager 1.2.0
+```
+
+변경 내용은 [`CHANGELOG.md`](CHANGELOG.md)와 [Releases](https://github.com/pilwonhur/clio-idea-manager/releases)에 있다.
+
+### 업데이트를 되돌리기
+
+새 버전이 이상하면 직전 스킬 코드로 되돌린다. **데이터는 관여하지 않으므로 그대로 남는다.**
+
+```bash
+cd ~/.claude/skills
+rm -rf clio-idea-manager && mv clio-idea-manager.prev clio-idea-manager
+scripts/idea_check --version    # 되돌아간 버전 확인
+```
+
+특정 버전으로 다시 설치하고 싶다면 저장소에서 그 태그를 꺼내 `install.sh`를 실행한다.
+
+```bash
+cd clio-idea-manager
+git checkout v1.1.0 && ./install.sh
+git checkout main               # 나중에 최신으로 복귀
+```
 
 ### 설치 경로 바꾸기
 
@@ -939,13 +1017,13 @@ scripts/idea_check calibrate
 ## 15. 테스트
 
 ```bash
-python3 tests/test_clio.py            # 28건, 격리된 임시 데이터 디렉터리에서 실제 스크립트 호출
+python3 tests/test_clio.py            # 29건, 격리된 임시 데이터 디렉터리에서 실제 스크립트 호출
 python3 tests/test_clio.py -v         # 개별 결과
 python3 -m unittest tests.test_clio.ClioTest.test_TC19_same_day_duplicate_without_message_id
 ```
 
 ```
-Ran 28 tests in 7.293s
+Ran 29 tests in 7.181s
 
 OK
 ```
@@ -975,8 +1053,9 @@ OK
 | TC19 | 같은 날 동일 문장 2회 → 저장 안 하고 기존 `entry_id` 안내 |
 | TC20 | 백업 미러 → `ideas.db` 원본이 동기화 경로에 존재하지 않음 |
 
-추가 8건이 번호 자릿수 초과 시 정렬, 대칭 관계 정규화, `undo` 계열, 지시어 변형,
-상세 출력의 시각 표기, 그리고 버전과 `CHANGELOG.md`의 일치를 검증한다.
+추가 9건이 번호 자릿수 초과 시 정렬, 대칭 관계 정규화, `undo` 계열, 지시어 변형,
+상세 출력의 시각 표기, 버전과 `CHANGELOG.md`의 일치, 그리고 설치·업데이트가
+데이터와 사용자 설정을 보존하는지를 검증한다.
 
 판단 계층(`SKILL.md`)의 대화 규칙은 `evals/evals.json`의 시나리오로 회귀 검증한다.
 저장 계층 테스트가 검증할 수 없는 것(무엇을 묻고 무엇을 묻지 않는가, 실패 시 문안)이 대상이다.
@@ -988,7 +1067,8 @@ OK
 ```
 SKILL.md              판단 계층 — 언제 포착하고 언제 묻고 무엇을 출력할지
 CHANGELOG.md          버전별 변경 이력 (버전의 단일 원본은 clio_core.CLIO_VERSION)
-install.sh            스킬·데이터 분리 설치
+install.sh            설치·업데이트 (첫 설치와 제자리 갱신을 같은 명령으로)
+update.sh             최신 버전 받아 적용 (git pull → install.sh)
 scripts/
   clio_core.py        공용 코어 — 스키마, 트랜잭션, 지시어 파서, 어간 처리, 유사도 점수
   idea_store          쓰기 — parse, capture, new-idea, assign, reassign, revise,
@@ -1001,7 +1081,7 @@ references/
   conversation-rules.md  응답 문안 모음
   recovery-policy.md  삭제·백업·복구 정책
 evals/evals.json      판단 계층 회귀 검증 시나리오
-tests/test_clio.py    저장 계층 자동 테스트 28건
+tests/test_clio.py    저장 계층 자동 테스트 29건
 ```
 
 | 단계 | 범위 | 상태 |
@@ -1058,6 +1138,15 @@ CLI에서 직접 부르는 것은 이미 명시적 의사 표시다.
 글감 50건 또는 운영 4주 후 `idea_check calibrate`가 채택률 95% 이상 구간을 보고할 때만.
 [§14](#임계값을-함부로-바꾸지-않는다) 참조.
 
+**Q. 업데이트하면 그동안 쌓은 글감이 날아가나?**
+날아가지 않는다. 업데이트는 `~/.claude/skills/…`의 **코드만** 갱신하고 `~/ClioData/`는
+읽지도 쓰지도 않는다(스키마 보장과 무결성 검사 제외). `config.json`에서 직접 고친 임계값도
+유지되며, 새 버전에서 생긴 키만 기본값으로 추가된다. 이 동작은 테스트로 강제된다.
+
+**Q. 업데이트 전에 기존 설치를 지워야 하나?**
+지우면 안 된다. `./update.sh`(또는 새 사본에서 `./install.sh`)만 실행하면 제자리에서
+갱신된다. 이전 버전에만 있던 파일은 스크립트가 알아서 정리한다.
+
 **Q. 데이터를 다른 도구로 옮기고 싶다.**
 `idea_export json`이 전량을 하나의 JSON으로, `idea_export md`가 글감당 한 파일로 낸다.
 DB 자체도 단일 SQLite 파일이라 그대로 복사하면 된다.
@@ -1080,6 +1169,9 @@ v1의 범위 밖이다. DB 원본을 동기화 폴더에 두면 손상 위험이
 | `SyntaxError` / `ModuleNotFoundError: zoneinfo` | Python 3.11 미만 | `python3 --version` 확인 후 3.11 이상으로 실행 |
 | 백업 미러가 비어 있다 | `backup_mirror` 경로가 없거나 `--no-mirror`를 줬다 | `config.json`의 경로를 만들고 다시 실행. 응답의 `mirrored_to`로 확인 |
 | 복구 후 지운 내용이 되살아났다 | 매니페스트 미적용 | `backups/redaction_manifest.json`을 복구 직후 다시 적용한다 |
+| 업데이트 후 동작이 이상하다 | 새 버전의 문제 | `~/.claude/skills/clio-idea-manager.prev`로 되돌린다 ([§4](#업데이트를-되돌리기)). 데이터는 영향받지 않는다 |
+| `update.sh`가 로컬 변경으로 멈춘다 | 저장소에 커밋하지 않은 수정이 있다 | `git status`로 확인 후 정리(`git stash` 또는 커밋)하고 다시 실행한다 |
+| 업데이트했는데 옛 동작이 그대로다 | 낡은 `__pycache__` | 설치 스크립트가 정리하지만, 수동 실행 중이라면 `find . -name __pycache__ -exec rm -rf {} +` |
 
 ---
 
@@ -1090,7 +1182,7 @@ v1의 범위 밖이다. DB 원본을 동기화 폴더에 두면 손상 위험이
 형식으로 남긴다.
 
 ```bash
-scripts/idea_store --version        # clio-idea-manager 1.1.0
+scripts/idea_store --version        # clio-idea-manager 1.2.0
 scripts/idea_check integrity        # 응답 JSON에 "clio_version" 포함
 ```
 
@@ -1113,8 +1205,8 @@ scripts/idea_check integrity        # 응답 JSON에 "clio_version" 포함
 # 1) CLIO_VERSION 수정 → 2) CHANGELOG.md 맨 위에 항목 추가 → 3) 테스트
 python3 tests/test_clio.py
 # 4) 커밋 → 5) 태그 → 6) 릴리스
-git commit -am "..." && git tag -a v1.1.0 -m "v1.1.0" && git push origin main --tags
-gh release create v1.1.0 --title "v1.1.0" --notes "CHANGELOG.md의 해당 절 내용"
+git commit -am "..." && git tag -a v1.2.0 -m "v1.2.0" && git push origin main --tags
+gh release create v1.2.0 --title "v1.2.0" --notes "CHANGELOG.md의 해당 절 내용"
 ```
 
 각 버전은 GitHub Releases에도 같은 내용으로 발행한다.
@@ -1183,6 +1275,6 @@ in the Software without restriction…
 | [`references/schema.md`](references/schema.md) | 데이터 모델과 단일 원본 규칙 |
 | [`references/conversation-rules.md`](references/conversation-rules.md) | 표준 응답 문안 |
 | [`references/recovery-policy.md`](references/recovery-policy.md) | 삭제·백업·복구 정책 |
-| [`tests/test_clio.py`](tests/test_clio.py) | 저장 계층 테스트 28건 |
+| [`tests/test_clio.py`](tests/test_clio.py) | 저장 계층 테스트 29건 |
 | [`docs/PRD.md`](docs/PRD.md) | 설계 근거 문서 v1.3 (요구사항·결정 사항 D1~D7·성공 기준) |
 | [`docs/manual.md`](docs/manual.md) | 사용자용 설명서 (CLI 없이 대화만으로 쓰는 법) |

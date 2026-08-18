@@ -187,6 +187,57 @@ class ClioTest(unittest.TestCase):
         self.assertIn(out["error"]["code"], ("storage_unavailable", "db_error"))
         self.assertNotIn("entry_id", out)
 
+    def test_install_then_update_keeps_data_and_user_config(self):
+        """업데이트는 지우고 다시 깔지 않는다 — 데이터·설정은 남고 낡은 파일만 사라진다."""
+        skill = Path(tempfile.mkdtemp(prefix="clio-skill-"))
+        data = Path(tempfile.mkdtemp(prefix="clio-instdata-"))
+        self.addCleanup(shutil.rmtree, skill, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, str(skill) + ".prev", ignore_errors=True)
+        self.addCleanup(shutil.rmtree, data, ignore_errors=True)
+
+        env = dict(os.environ, CLIO_SKILL_DIR=str(skill), CLIO_DATA_DIR=str(data))
+
+        def install():
+            out = subprocess.run(["bash", str(ROOT / "install.sh")],
+                                 capture_output=True, text=True, env=env, cwd=str(ROOT))
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            return out.stdout
+
+        first = install()
+        self.assertIn("설치 완료", first)
+        self.assertTrue((skill / "scripts" / "idea_store").exists())
+        self.assertTrue((data / "ideas.db").exists())
+
+        # 사용자가 쌓은 데이터와 손댄 설정
+        entry = self.sh("idea_store", "capture", "--body", "업데이트를 견뎌야 하는 원문",
+                         "--message-id", "keep1", env=env)
+        cfg_path = data / "config.json"
+        cfg = json.loads(cfg_path.read_text(encoding="utf-8"))
+        cfg["ask_threshold"] = 0.42
+        del cfg["mention_threshold"]          # 새 설정 키가 추가되는 상황을 흉내낸다
+        cfg_path.write_text(json.dumps(cfg), encoding="utf-8")
+
+        stale = skill / "scripts" / "지워져야_하는_파일.py"
+        stale.write_text("# 이전 버전의 잔재\n", encoding="utf-8")
+
+        second = install()
+        self.assertIn("업데이트 완료", second)
+
+        # 데이터는 그대로
+        self.assertTrue((data / "ideas.db").exists())
+        rows = self.sh("idea_search", "unassigned", env=env)["entries"]
+        self.assertIn(entry["entry_id"], [r["entry_id"] for r in rows])
+
+        # 사용자가 고친 값은 유지, 빠진 키만 기본값으로 채움
+        merged = json.loads(cfg_path.read_text(encoding="utf-8"))
+        self.assertEqual(merged["ask_threshold"], 0.42)
+        self.assertEqual(merged["mention_threshold"],
+                         clio_core.DEFAULT_CONFIG["mention_threshold"])
+
+        # 낡은 파일은 사라지고, 되돌릴 수 있게 직전 스킬이 남는다
+        self.assertFalse(stale.exists())
+        self.assertTrue(Path(str(skill) + ".prev", "scripts", "idea_store").exists())
+
     def test_version_is_reported_and_matches_changelog(self):
         """버전은 CLIO_VERSION이 단일 원본이고, CHANGELOG 맨 위 항목과 일치해야 한다."""
         import re
