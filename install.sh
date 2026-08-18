@@ -30,9 +30,13 @@ PY
 NEW_VER="$(version_of "$SRC")"
 OLD_VER="$(version_of "$SKILL_DIR")"
 
-if [ -n "$OLD_VER" ]; then
+# 설치 여부는 파일 존재로 판정한다. v1.1.0 이전 스킬에는 CLIO_VERSION이 없으므로
+# 버전 문자열로 판정하면 기존 설치를 신규로 오인해 롤백본을 만들지 않는다.
+if [ -f "$SKILL_DIR/scripts/clio_core.py" ]; then
   MODE="업데이트"
-  if [ "$OLD_VER" = "$NEW_VER" ]; then
+  if [ -z "$OLD_VER" ]; then
+    echo "== Clio 스킬 업데이트: 버전 미상(1.1.0 이전) → $NEW_VER =="
+  elif [ "$OLD_VER" = "$NEW_VER" ]; then
     echo "== Clio 스킬 재적용 (버전 $OLD_VER, 변경분만 반영) =="
   else
     echo "== Clio 스킬 업데이트: $OLD_VER → $NEW_VER =="
@@ -156,6 +160,7 @@ CLIO_DATA_DIR="$DATA_DIR" python3 "$SKILL_DIR/scripts/idea_check" integrity \
 echo
 echo "$MODE 완료 — clio-idea-manager $NEW_VER"
 echo "데이터베이스: $DATA_DIR/ideas.db"
-[ "$MODE" = "업데이트" ] && [ "$OLD_VER" != "$NEW_VER" ] && \
+if [ "$MODE" = "업데이트" ] && [ "$OLD_VER" != "$NEW_VER" ]; then
   echo "변경 내용: $SKILL_DIR/CHANGELOG.md"
+fi
 exit 0

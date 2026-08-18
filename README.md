@@ -6,11 +6,11 @@ Discord·Telegram·WhatsApp 같은 메신저로 던진 한 문장이 대화 로�
 지시어 하나로 원문을 그대로 데이터베이스에 커밋하고, 그 뒤에 분류·정제·연결을 이어붙인다.
 판단은 LLM이 하고 저장은 결정론적 CLI 도구가 한다. 외부 의존성은 없다.
 
-[![version](https://img.shields.io/badge/version-1.2.0-informational)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.2.1-informational)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![dependencies](https://img.shields.io/badge/dependencies-none-success)](#요구사항)
 [![storage](https://img.shields.io/badge/storage-SQLite%20%2B%20FTS5-003B57?logo=sqlite&logoColor=white)](#8-데이터-모델)
-[![tests](https://img.shields.io/badge/tests-29%20passing-brightgreen)](#15-테스트)
+[![tests](https://img.shields.io/badge/tests-30%20passing-brightgreen)](#15-테스트)
 [![license](https://img.shields.io/badge/license-MIT-blue)](#20-라이선스)
 
 > Claude Code / Claude Agent Skill 형식으로 배포된다. 스킬을 설치하지 않고
@@ -1017,13 +1017,13 @@ scripts/idea_check calibrate
 ## 15. 테스트
 
 ```bash
-python3 tests/test_clio.py            # 29건, 격리된 임시 데이터 디렉터리에서 실제 스크립트 호출
+python3 tests/test_clio.py            # 30건, 격리된 임시 데이터 디렉터리에서 실제 스크립트 호출
 python3 tests/test_clio.py -v         # 개별 결과
 python3 -m unittest tests.test_clio.ClioTest.test_TC19_same_day_duplicate_without_message_id
 ```
 
 ```
-Ran 29 tests in 7.181s
+Ran 30 tests in 7.787s
 
 OK
 ```
@@ -1053,9 +1053,9 @@ OK
 | TC19 | 같은 날 동일 문장 2회 → 저장 안 하고 기존 `entry_id` 안내 |
 | TC20 | 백업 미러 → `ideas.db` 원본이 동기화 경로에 존재하지 않음 |
 
-추가 9건이 번호 자릿수 초과 시 정렬, 대칭 관계 정규화, `undo` 계열, 지시어 변형,
+추가 10건이 번호 자릿수 초과 시 정렬, 대칭 관계 정규화, `undo` 계열, 지시어 변형,
 상세 출력의 시각 표기, 버전과 `CHANGELOG.md`의 일치, 그리고 설치·업데이트가
-데이터와 사용자 설정을 보존하는지를 검증한다.
+데이터와 사용자 설정을 보존하는지(구버전 설치본에서의 업그레이드 포함)를 검증한다.
 
 판단 계층(`SKILL.md`)의 대화 규칙은 `evals/evals.json`의 시나리오로 회귀 검증한다.
 저장 계층 테스트가 검증할 수 없는 것(무엇을 묻고 무엇을 묻지 않는가, 실패 시 문안)이 대상이다.
@@ -1081,7 +1081,7 @@ references/
   conversation-rules.md  응답 문안 모음
   recovery-policy.md  삭제·백업·복구 정책
 evals/evals.json      판단 계층 회귀 검증 시나리오
-tests/test_clio.py    저장 계층 자동 테스트 29건
+tests/test_clio.py    저장 계층 자동 테스트 30건
 ```
 
 | 단계 | 범위 | 상태 |
@@ -1182,7 +1182,7 @@ v1의 범위 밖이다. DB 원본을 동기화 폴더에 두면 손상 위험이
 형식으로 남긴다.
 
 ```bash
-scripts/idea_store --version        # clio-idea-manager 1.2.0
+scripts/idea_store --version        # clio-idea-manager 1.2.1
 scripts/idea_check integrity        # 응답 JSON에 "clio_version" 포함
 ```
 
@@ -1275,6 +1275,6 @@ in the Software without restriction…
 | [`references/schema.md`](references/schema.md) | 데이터 모델과 단일 원본 규칙 |
 | [`references/conversation-rules.md`](references/conversation-rules.md) | 표준 응답 문안 |
 | [`references/recovery-policy.md`](references/recovery-policy.md) | 삭제·백업·복구 정책 |
-| [`tests/test_clio.py`](tests/test_clio.py) | 저장 계층 테스트 29건 |
+| [`tests/test_clio.py`](tests/test_clio.py) | 저장 계층 테스트 30건 |
 | [`docs/PRD.md`](docs/PRD.md) | 설계 근거 문서 v1.3 (요구사항·결정 사항 D1~D7·성공 기준) |
 | [`docs/manual.md`](docs/manual.md) | 사용자용 설명서 (CLI 없이 대화만으로 쓰는 법) |

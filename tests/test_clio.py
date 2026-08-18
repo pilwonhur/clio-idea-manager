@@ -238,6 +238,34 @@ class ClioTest(unittest.TestCase):
         self.assertFalse(stale.exists())
         self.assertTrue(Path(str(skill) + ".prev", "scripts", "idea_store").exists())
 
+    def test_update_from_pre_versioned_install_is_detected(self):
+        """CLIO_VERSION이 없던 구버전 설치도 업데이트로 인식하고 롤백본을 남긴다."""
+        skill = Path(tempfile.mkdtemp(prefix="clio-legacy-"))
+        data = Path(tempfile.mkdtemp(prefix="clio-legacydata-"))
+        self.addCleanup(shutil.rmtree, skill, ignore_errors=True)
+        self.addCleanup(shutil.rmtree, str(skill) + ".prev", ignore_errors=True)
+        self.addCleanup(shutil.rmtree, data, ignore_errors=True)
+        env = dict(os.environ, CLIO_SKILL_DIR=str(skill), CLIO_DATA_DIR=str(data))
+
+        def install():
+            out = subprocess.run(["bash", str(ROOT / "install.sh")],
+                                 capture_output=True, text=True, env=env, cwd=str(ROOT))
+            self.assertEqual(out.returncode, 0, out.stdout + out.stderr)
+            return out.stdout
+
+        install()
+
+        # 버전 상수가 없던 시절의 설치본을 흉내낸다
+        core = skill / "scripts" / "clio_core.py"
+        core.write_text(
+            "\n".join(l for l in core.read_text(encoding="utf-8").splitlines()
+                      if not l.startswith("CLIO_VERSION")) + "\n", encoding="utf-8")
+
+        out = install()
+        self.assertIn("업데이트", out)
+        self.assertIn("버전 미상", out)
+        self.assertTrue(Path(str(skill) + ".prev", "scripts", "clio_core.py").exists())
+
     def test_version_is_reported_and_matches_changelog(self):
         """버전은 CLIO_VERSION이 단일 원본이고, CHANGELOG 맨 위 항목과 일치해야 한다."""
         import re

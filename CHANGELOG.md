@@ -14,6 +14,16 @@
 
 데이터 파일 형식의 버전(`SCHEMA_VERSION`)은 별도로 관리한다. 현재 `1`.
 
+## [1.2.1] — 2026-08-19
+
+### 수정
+
+- v1.1.0 이전(=`CLIO_VERSION`이 없던) 설치본을 업데이트할 때 **신규 설치로 오인해
+  롤백본(`<스킬 경로>.prev`)을 만들지 않던 문제.** 설치 여부를 버전 문자열이 아니라
+  `scripts/clio_core.py`의 존재로 판정하도록 고쳤다. 이 경로를 검증하는 테스트 추가 (총 30건).
+- 스크립트 마지막 줄의 조건부 `echo`를 `if` 문으로 바꿨다 (`set -e`에서 종료 코드가
+  조건 결과에 좌우되지 않도록).
+
 ## [1.2.0] — 2026-08-18
 
 ### 추가
@@ -77,6 +87,7 @@
 - 온라인 스냅샷 백업(일 7/주 4/월 12), redaction manifest, 복구 시험.
 - 저장 계층 테스트 26건.
 
+[1.2.1]: https://github.com/pilwonhur/clio-idea-manager/releases/tag/v1.2.1
 [1.2.0]: https://github.com/pilwonhur/clio-idea-manager/releases/tag/v1.2.0
 [1.1.0]: https://github.com/pilwonhur/clio-idea-manager/releases/tag/v1.1.0
 [1.0.0]: https://github.com/pilwonhur/clio-idea-manager/releases/tag/v1.0.0
