@@ -9,7 +9,7 @@ Discord·Telegram·WhatsApp 같은 메신저로 던진 한 문장이 대화 로�
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![dependencies](https://img.shields.io/badge/dependencies-none-success)](#요구사항)
 [![storage](https://img.shields.io/badge/storage-SQLite%20%2B%20FTS5-003B57?logo=sqlite&logoColor=white)](#8-데이터-모델)
-[![tests](https://img.shields.io/badge/tests-26%20passing-brightgreen)](#15-테스트)
+[![tests](https://img.shields.io/badge/tests-27%20passing-brightgreen)](#15-테스트)
 [![license](https://img.shields.io/badge/license-MIT-blue)](#19-라이선스)
 
 > Claude Code / Claude Agent Skill 형식으로 배포된다. 스킬을 설치하지 않고
@@ -296,7 +296,7 @@ python3 scripts/idea_search show --idea-ref CLIO-0001 --format text
 ```
 CLIO-0001 — 선택적 망각
 보관 상태: active   발전 단계: developed
-생성일: 2026-08-18   최종 업데이트: 2026-08-18
+생성일: 2026-08-18 21:48   최종 업데이트: 2026-08-18 21:48
 전체 기록일: 08-18
 키워드: 기억, 망각
 관련 글감: CLIO-0002 (similar, 확인됨)
@@ -304,7 +304,7 @@ CLIO-0001 — 선택적 망각
 파생 글감: 없음
 
 [날짜별 원문]  ← 교수님 원문, 무수정
-2026-08-18 21:48
+2026-08-18 21:48:35
 기억하는 능력보다 선택적으로 잊는 능력이 중요하다
 
 [정제본 rev.1]  ← Clio 작성
@@ -440,7 +440,7 @@ scripts/idea_store parse --message "<메시지 원본>"   # 쓰기 없이 판정
 | 테이블 | 역할 |
 |---|---|
 | `idea` | 글감의 **현재 상태**만. 번호(`ref`), 제목, 보관 상태, 발전 단계, 최신 revision 참조. `deleted_at`은 tombstone |
-| `raw_entry` | 원문. 수정하지 않고 계속 쌓는다. `idea_id`가 NULL이면 미분류. `body_hash`로 무결성 검증, `redacted_at`은 영구 삭제 흔적 |
+| `raw_entry` | 원문. 수정하지 않고 계속 쌓는다. `idea_id`가 NULL이면 미분류. `body_hash`로 무결성 검증, `redacted_at`은 영구 삭제 흔적. 시각은 두 개다 — `captured_at`(보낸 시각), `ingested_at`(기록한 시각) |
 | `source` | 출처. `(platform, message_id)`가 유니크. Discord 외 채널로 일반화 |
 | `attachment` | 첨부 원본 사본. 파일명이 내용 해시이므로 같은 파일은 한 번만 저장된다 |
 | `revision` | 정제본 이력. 불변. `rev_no`는 글감 안에서 1부터 증가 |
@@ -477,6 +477,33 @@ scripts/idea_store parse --message "<메시지 원본>"   # 쓰기 없이 판정
 
 **합성은 부모를 삭제하지 않는다.** 새 번호를 발급하고, 각 부모에 대해
 `(새 글감 → 부모, derived_from)` 관계를 만든다. 부모는 그대로 남는다(TC4).
+
+### 시각
+
+모든 시각은 **ISO8601, 초 단위, 오프셋 포함**으로 저장한다 (`2026-08-17T09:12:04+09:00`).
+마이크로초는 버린다. 시간대는 `config.json`의 `timezone`(기본 `Asia/Seoul`)을 따른다.
+
+| 컬럼 | 뜻 |
+|---|---|
+| `raw_entry.captured_at` | **보낸 시각.** 브리지가 메시지 원 타임스탬프를 주면 `--captured-at`으로 그대로 싣는다 |
+| `raw_entry.ingested_at` | **기록한 시각.** 도구가 항상 자동으로 남긴다 |
+| `idea.created_at` / `updated_at` | 글감 생성·최종 변경 시각 |
+| `revision.created_at`, `idea_relation.created_at`, `action_log.created_at` | 각 사건의 발생 시각 |
+
+`--captured-at`을 주지 않으면 `captured_at`은 처리 시각과 같아진다. **시각을 추정해서
+채워 넣지 않는다** — 원문 위조와 같기 때문이다.
+
+표시 계층은 용도에 따라 잘라 쓴다. 목록(`list`)은 날짜만, 상세(`show`)의 원문 헤더는
+**초 단위까지** 보여주며, 보낸 시각과 기록한 시각이 다르면 함께 낸다.
+
+```
+[날짜별 원문]  ← 교수님 원문, 무수정
+2026-08-17 09:12:04  (기록 2026-08-18 23:42:47)
+기억하는 능력보다 선택적으로 잊는 능력이 중요하다
+```
+
+저장된 전체 값(오프셋 포함)은 `show`의 JSON 출력, `trace`, `export json`,
+`export md`에서 그대로 볼 수 있다.
 
 ### 글감 번호
 
@@ -643,6 +670,8 @@ idea_check    운영   — 초기화, 무결성, 백업, 복구 시험, 대조, 
   아무것도 쓰지 않는다(TC13).
 - `--body` / `--body-file` / 표준입력은 지시어 판정을 거치지 않는다. 소급 저장과
   파일 임포트 경로다. 원문 그대로 저장하며 앞뒤 개행만 정리한다.
+- `--captured-at`은 **메시지를 보낸 시각**이다(ISO8601, 오프셋 포함). 생략하면 처리 시각이
+  들어가며, `ingested_at`은 어느 경우에나 도구가 자동으로 남긴다 ([§8 시각](#시각)).
 - `undo`가 되돌릴 수 있는 작업: `assign`, `new_idea`, `reassign`, `revise`, `relate`,
   `merge`, `split`, `set_state`, `tag`. **`capture`와 영구 삭제는 되돌리지 않는다.**
 
@@ -908,13 +937,13 @@ scripts/idea_check calibrate
 ## 15. 테스트
 
 ```bash
-python3 tests/test_clio.py            # 26건, 격리된 임시 데이터 디렉터리에서 실제 스크립트 호출
+python3 tests/test_clio.py            # 27건, 격리된 임시 데이터 디렉터리에서 실제 스크립트 호출
 python3 tests/test_clio.py -v         # 개별 결과
 python3 -m unittest tests.test_clio.ClioTest.test_TC19_same_day_duplicate_without_message_id
 ```
 
 ```
-Ran 26 tests in 7.085s
+Ran 27 tests in 6.559s
 
 OK
 ```
@@ -944,7 +973,8 @@ OK
 | TC19 | 같은 날 동일 문장 2회 → 저장 안 하고 기존 `entry_id` 안내 |
 | TC20 | 백업 미러 → `ideas.db` 원본이 동기화 경로에 존재하지 않음 |
 
-추가 6건이 번호 자릿수 초과 시 정렬, 대칭 관계 정규화, `undo` 계열, 지시어 변형을 검증한다.
+추가 7건이 번호 자릿수 초과 시 정렬, 대칭 관계 정규화, `undo` 계열, 지시어 변형,
+상세 출력의 시각 표기를 검증한다.
 
 판단 계층(`SKILL.md`)의 대화 규칙은 `evals/evals.json`의 시나리오로 회귀 검증한다.
 저장 계층 테스트가 검증할 수 없는 것(무엇을 묻고 무엇을 묻지 않는가, 실패 시 문안)이 대상이다.
@@ -968,7 +998,7 @@ references/
   conversation-rules.md  응답 문안 모음
   recovery-policy.md  삭제·백업·복구 정책
 evals/evals.json      판단 계층 회귀 검증 시나리오
-tests/test_clio.py    저장 계층 자동 테스트 26건
+tests/test_clio.py    저장 계층 자동 테스트 27건
 ```
 
 | 단계 | 범위 | 상태 |
@@ -1002,6 +1032,12 @@ CLI에서 직접 부르는 것은 이미 명시적 의사 표시다.
 **Q. 왜 `핵심:` 한 줄은 저장되지 않나?**
 그것은 대화용 확인 문구이지 정제본이 아니다. 정제본은 명시적으로 요청받았을 때만
 `revise`로 만든다. 원문을 추가했다는 이유로 정제본을 갱신하지도 않는다(TC18).
+
+**Q. 어떤 글감이 언제 몇 시에 들어왔는지 보고 싶다.**
+시각은 초 단위로 저장되어 있다. `idea_search show --idea-ref CLIO-0001 --format text`의
+원문 헤더가 `2026-08-17 09:12:04` 형태로 보여주고, 원문 하나만 볼 때는
+`idea_search trace --entry-id N`이 `captured_at`(보낸 시각)과 `ingested_at`(기록한 시각)을
+모두 낸다. 목록(`list`)이 날짜만 보여주는 것은 요약을 위한 표시일 뿐 저장 한계가 아니다.
 
 **Q. 번호가 중간에 비어 있다.**
 정상이다. 영구 삭제된 번호는 회수하지 않는다. 무결성 검사도 공백을 오류로 보지 않고
@@ -1104,6 +1140,6 @@ in the Software without restriction…
 | [`references/schema.md`](references/schema.md) | 데이터 모델과 단일 원본 규칙 |
 | [`references/conversation-rules.md`](references/conversation-rules.md) | 표준 응답 문안 |
 | [`references/recovery-policy.md`](references/recovery-policy.md) | 삭제·백업·복구 정책 |
-| [`tests/test_clio.py`](tests/test_clio.py) | 저장 계층 테스트 26건 |
+| [`tests/test_clio.py`](tests/test_clio.py) | 저장 계층 테스트 27건 |
 | [`docs/PRD.md`](docs/PRD.md) | 설계 근거 문서 v1.3 (요구사항·결정 사항 D1~D7·성공 기준) |
 | [`docs/manual.md`](docs/manual.md) | 사용자용 설명서 (CLI 없이 대화만으로 쓰는 법) |

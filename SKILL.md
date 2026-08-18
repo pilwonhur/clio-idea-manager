@@ -60,7 +60,8 @@ scripts/idea_search list --limit 1        # 최근 업데이트순 1건 = 직전
 ```bash
 # 1) 원문을 먼저 커밋한다. 지시어 판정도 이 명령이 강제한다.
 scripts/idea_store capture --raw-message "<메시지 원본>" \
-  --platform discord --message-id <ID> --author-id <ID> --channel-id <ID>
+  --platform discord --message-id <ID> --author-id <ID> --channel-id <ID> \
+  --captured-at <메시지 원 시각>          # 브리지가 넘겨줄 때만 (§2.1)
 # → {"entry_id": 21, "assign_state": "unassigned", ...}
 
 # 2) 그다음에 분류한다.
@@ -69,6 +70,18 @@ scripts/idea_search similar --entry-id 21
 ```
 
 `capture`가 실패하면 거기서 멈춘다. 분류로 넘어가지 않고, 저장됐다고 말하지 않는다.
+
+### 2.1 입력 시각은 브리지가 준 값을 그대로 싣는다
+
+`--captured-at`은 **교수님이 메시지를 보낸 시각**이고, 도구가 자동으로 남기는 `ingested_at`은
+**Clio가 기록한 시각**이다. 브리지가 메시지 원 타임스탬프를 넘겨주면 ISO8601(오프셋 포함)로
+그대로 실어 보낸다. 예: `--captured-at 2026-08-17T09:12:04+09:00`.
+
+- 브리지가 주지 않으면 **붙이지 않는다.** 이때 입력 시각은 처리 시각과 같아진다.
+- **시각을 추정해서 만들어 넣지 않는다.** "아까 아침에 보낸 것"이라는 말만으로 시각을
+  지어내는 것은 원문 위조와 같다. 교수님이 명시적으로 시각을 알려주신 경우에만 그 값을 쓴다.
+- 소급 저장(`retro`)도 마찬가지다. 원 시각을 알 수 없으면 생략하고, 필요하면
+  "기록 시각으로 저장했습니다"라고 알린다.
 
 ### decision별 처리
 
@@ -142,8 +155,12 @@ scripts/idea_search show --idea-ref CLIO-0012 --format text
 scripts/idea_search query --q "기억 망각" --format text     # 판단 근거 포함
 scripts/idea_search unassigned
 scripts/idea_search relations --idea-ref CLIO-0007
-scripts/idea_search trace --entry-id 21                    # 출처 메시지 역추적
+scripts/idea_search trace --entry-id 21                    # 출처 메시지 역추적 + 입력·기록 시각
 ```
+
+**시각을 물으실 때:** `show --format text`의 원문 헤더가 초 단위까지 보여준다.
+입력 시각과 기록 시각이 다르면 `2026-08-17 09:12:04  (기록 2026-08-18 23:42:47)`처럼 함께 나온다.
+목록의 날짜만으로 부족하면 `show` 또는 `trace`를 쓰고, 날짜를 임의로 추정하지 않는다.
 
 자연어 조회 대응: "보관된 글감" → `--state archived` · "이번 달" → `query --since`
 · "최근 10개" → `list --limit 10` · "CLIO-0007과 연결된" → `relations`.

@@ -93,7 +93,8 @@ def _idea_dict(conn, idea, full=False):
     if not full:
         return d
     d["raw_entries"] = [
-        {"entry_id": r["id"], "captured_at": r["captured_at"], "type": r["entry_type"],
+        {"entry_id": r["id"], "captured_at": r["captured_at"],
+         "ingested_at": r["ingested_at"], "type": r["entry_type"],
          "body": r["body"], "redacted": bool(r["redacted_at"])}
         for r in conn.execute(
             "SELECT * FROM raw_entry WHERE idea_id=? ORDER BY captured_at, id", (idea["id"],))]
@@ -118,6 +119,24 @@ def _idea_dict(conn, idea, full=False):
 # 표시 형식 (PRD §8.3, §8.4)
 # --------------------------------------------------------------------------
 
+def _stamp(ts, sec=True):
+    """저장된 ISO8601을 사람이 읽는 형태로. 오프셋은 전 기록이 동일하므로 생략한다."""
+    return ts[:19 if sec else 16].replace("T", " ")
+
+
+def _entry_stamp(e):
+    """원문 헤더의 시각.
+
+    captured_at은 교수님이 메시지를 보낸 시각, ingested_at은 Clio가 기록한 시각이다.
+    브리지가 원 시각을 넘겨주지 않으면 둘이 같으므로, 다를 때만 기록 시각을 덧붙인다.
+    """
+    stamp = _stamp(e["captured_at"])
+    ing = e.get("ingested_at")
+    if ing and ing[:19] != e["captured_at"][:19]:
+        stamp += f"  (기록 {_stamp(ing)})"
+    return stamp
+
+
 def render_list(items):
     out = []
     for d in items:
@@ -135,7 +154,8 @@ def render_show(d):
     lines = [
         f"{d['ref']} — {d['title']}",
         f"보관 상태: {d['storage_state']}   발전 단계: {d['dev_stage']}",
-        f"생성일: {d['created_at'][:10]}   최종 업데이트: {d['updated_at'][:10]}",
+        f"생성일: {_stamp(d['created_at'], sec=False)}   "
+        f"최종 업데이트: {_stamp(d['updated_at'], sec=False)}",
         f"전체 기록일: {', '.join(x[5:] for x in d['record_dates']) or '-'}",
         f"키워드: {', '.join(d['tags']) or '-'}",
         "관련 글감: " + (", ".join(
@@ -146,7 +166,7 @@ def render_show(d):
         "", "[날짜별 원문]  ← 교수님 원문, 무수정",
     ]
     for e in d["raw_entries"]:
-        lines.append(e["captured_at"][:16].replace("T", " "))
+        lines.append(_entry_stamp(e))
         lines.append("(영구 삭제됨)" if e["redacted"] else e["body"])
         lines.append("")
     if d["latest_revision"]:

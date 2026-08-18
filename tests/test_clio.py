@@ -187,6 +187,28 @@ class ClioTest(unittest.TestCase):
         self.assertIn(out["error"]["code"], ("storage_unavailable", "db_error"))
         self.assertNotIn("entry_id", out)
 
+    def test_detail_output_shows_capture_time_to_the_second(self):
+        """상세 출력은 입력 시각을 초 단위까지 보여주고, 기록 시각과 다르면 함께 낸다."""
+        idea, e = self.make_idea("아침에 떠오른 문장", "시각 표시",
+                                  message_id="ts1", captured_at="2026-08-17T09:12:04+09:00")
+        text = self.sh("idea_search", "show", "--idea-ref", idea["ref"],
+                        "--format", "text")["text"]
+        self.assertIn("2026-08-17 09:12:04", text)
+        self.assertIn("(기록 ", text)          # captured_at != ingested_at
+
+        detail = self.sh("idea_search", "show", "--idea-ref", idea["ref"])
+        entry = detail["raw_entries"][0]
+        self.assertEqual(entry["captured_at"], "2026-08-17T09:12:04+09:00")
+        self.assertNotEqual(entry["captured_at"][:19], entry["ingested_at"][:19])
+
+        # 브리지가 원 시각을 주지 않으면 괄호 없이 한 시각만 나온다
+        e2 = self.capture("바로 지금 보낸 문장", message_id="ts2")
+        self.sh("idea_store", "assign", "--entry-id", e2["entry_id"],
+                 "--idea-ref", idea["ref"])
+        text2 = self.sh("idea_search", "show", "--idea-ref", idea["ref"],
+                         "--format", "text")["text"]
+        self.assertEqual(text2.count("(기록 "), 1)
+
     # -- TC10 -------------------------------------------------------------
     def test_TC10_output_separates_user_text_from_clio(self):
         idea, _ = self.make_idea("교수님의 원문 그대로", "구분 시험", message_id="s1")
