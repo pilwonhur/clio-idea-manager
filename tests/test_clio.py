@@ -187,6 +187,24 @@ class ClioTest(unittest.TestCase):
         self.assertIn(out["error"]["code"], ("storage_unavailable", "db_error"))
         self.assertNotIn("entry_id", out)
 
+    def test_version_is_reported_and_matches_changelog(self):
+        """버전은 CLIO_VERSION이 단일 원본이고, CHANGELOG 맨 위 항목과 일치해야 한다."""
+        import re
+        version = clio_core.CLIO_VERSION
+        self.assertRegex(version, r"^\d+\.\d+\.\d+$")
+
+        for tool in ("idea_store", "idea_search", "idea_export", "idea_check"):
+            out = subprocess.run([sys.executable, str(SCRIPTS / tool), "--version"],
+                                 capture_output=True, text=True, env=self.env)
+            self.assertEqual(out.returncode, 0, tool)
+            self.assertIn(version, out.stdout + out.stderr, tool)
+
+        changelog = (ROOT / "CHANGELOG.md").read_text(encoding="utf-8")
+        latest = re.search(r"^## \[(\d+\.\d+\.\d+)\]", changelog, re.M)
+        self.assertIsNotNone(latest, "CHANGELOG.md에 버전 항목이 없습니다")
+        self.assertEqual(latest.group(1), version,
+                         "CLIO_VERSION과 CHANGELOG 최신 항목이 어긋납니다")
+
     def test_detail_output_shows_capture_time_to_the_second(self):
         """상세 출력은 입력 시각을 초 단위까지 보여주고, 기록 시각과 다르면 함께 낸다."""
         idea, e = self.make_idea("아침에 떠오른 문장", "시각 표시",

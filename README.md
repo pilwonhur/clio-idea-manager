@@ -6,11 +6,12 @@ Discord·Telegram·WhatsApp 같은 메신저로 던진 한 문장이 대화 로�
 지시어 하나로 원문을 그대로 데이터베이스에 커밋하고, 그 뒤에 분류·정제·연결을 이어붙인다.
 판단은 LLM이 하고 저장은 결정론적 CLI 도구가 한다. 외부 의존성은 없다.
 
+[![version](https://img.shields.io/badge/version-1.1.0-informational)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![dependencies](https://img.shields.io/badge/dependencies-none-success)](#요구사항)
 [![storage](https://img.shields.io/badge/storage-SQLite%20%2B%20FTS5-003B57?logo=sqlite&logoColor=white)](#8-데이터-모델)
-[![tests](https://img.shields.io/badge/tests-27%20passing-brightgreen)](#15-테스트)
-[![license](https://img.shields.io/badge/license-MIT-blue)](#19-라이선스)
+[![tests](https://img.shields.io/badge/tests-28%20passing-brightgreen)](#15-테스트)
+[![license](https://img.shields.io/badge/license-MIT-blue)](#20-라이선스)
 
 > Claude Code / Claude Agent Skill 형식으로 배포된다. 스킬을 설치하지 않고
 > CLI 도구만 단독으로 쓰는 것도 가능하다 ([§5 빠른 시작](#5-빠른-시작-cli-단독)).
@@ -36,8 +37,9 @@ Discord·Telegram·WhatsApp 같은 메신저로 던진 한 문장이 대화 로�
 15. [테스트](#15-테스트)
 16. [프로젝트 구조와 구현 현황](#16-프로젝트-구조와-구현-현황)
 17. [FAQ와 트러블슈팅](#17-faq와-트러블슈팅)
-18. [기여](#18-기여)
-19. [라이선스](#19-라이선스)
+18. [버전 정책](#18-버전-정책)
+19. [기여](#19-기여)
+20. [라이선스](#20-라이선스)
 
 ---
 
@@ -937,13 +939,13 @@ scripts/idea_check calibrate
 ## 15. 테스트
 
 ```bash
-python3 tests/test_clio.py            # 27건, 격리된 임시 데이터 디렉터리에서 실제 스크립트 호출
+python3 tests/test_clio.py            # 28건, 격리된 임시 데이터 디렉터리에서 실제 스크립트 호출
 python3 tests/test_clio.py -v         # 개별 결과
 python3 -m unittest tests.test_clio.ClioTest.test_TC19_same_day_duplicate_without_message_id
 ```
 
 ```
-Ran 27 tests in 6.559s
+Ran 28 tests in 7.293s
 
 OK
 ```
@@ -973,8 +975,8 @@ OK
 | TC19 | 같은 날 동일 문장 2회 → 저장 안 하고 기존 `entry_id` 안내 |
 | TC20 | 백업 미러 → `ideas.db` 원본이 동기화 경로에 존재하지 않음 |
 
-추가 7건이 번호 자릿수 초과 시 정렬, 대칭 관계 정규화, `undo` 계열, 지시어 변형,
-상세 출력의 시각 표기를 검증한다.
+추가 8건이 번호 자릿수 초과 시 정렬, 대칭 관계 정규화, `undo` 계열, 지시어 변형,
+상세 출력의 시각 표기, 그리고 버전과 `CHANGELOG.md`의 일치를 검증한다.
 
 판단 계층(`SKILL.md`)의 대화 규칙은 `evals/evals.json`의 시나리오로 회귀 검증한다.
 저장 계층 테스트가 검증할 수 없는 것(무엇을 묻고 무엇을 묻지 않는가, 실패 시 문안)이 대상이다.
@@ -985,6 +987,7 @@ OK
 
 ```
 SKILL.md              판단 계층 — 언제 포착하고 언제 묻고 무엇을 출력할지
+CHANGELOG.md          버전별 변경 이력 (버전의 단일 원본은 clio_core.CLIO_VERSION)
 install.sh            스킬·데이터 분리 설치
 scripts/
   clio_core.py        공용 코어 — 스키마, 트랜잭션, 지시어 파서, 어간 처리, 유사도 점수
@@ -998,7 +1001,7 @@ references/
   conversation-rules.md  응답 문안 모음
   recovery-policy.md  삭제·백업·복구 정책
 evals/evals.json      판단 계층 회귀 검증 시나리오
-tests/test_clio.py    저장 계층 자동 테스트 27건
+tests/test_clio.py    저장 계층 자동 테스트 28건
 ```
 
 | 단계 | 범위 | 상태 |
@@ -1080,7 +1083,45 @@ v1의 범위 밖이다. DB 원본을 동기화 폴더에 두면 손상 위험이
 
 ---
 
-## 18. 기여
+## 18. 버전 정책
+
+배포 버전은 [유의적 버전(SemVer)](https://semver.org/lang/ko/)을 따르고,
+변경 이력은 [`CHANGELOG.md`](CHANGELOG.md)에 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)
+형식으로 남긴다.
+
+```bash
+scripts/idea_store --version        # clio-idea-manager 1.1.0
+scripts/idea_check integrity        # 응답 JSON에 "clio_version" 포함
+```
+
+| 자리 | 올리는 경우 | 예 |
+|---|---|---|
+| MAJOR | 기존 데이터나 명령 계약이 깨지는 변경 (마이그레이션 필요) | 스키마 비호환 변경, 명령 삭제 |
+| MINOR | 명령·출력·판단 규칙의 추가나 변경 (하위 호환) | 새 서브커맨드, 출력 형식 확장 |
+| PATCH | 버그 수정, 문서 수정 | 오탈자, 오동작 수정 |
+
+**버전의 단일 원본은 `scripts/clio_core.py`의 `CLIO_VERSION`이다.** 네 도구의 `--version`과
+`idea_check`의 응답이 모두 이 값을 읽고, 테스트가 `CHANGELOG.md` 맨 위 항목과의 일치를
+검사하므로 한쪽만 올리면 빌드가 깨진다.
+
+데이터 파일 형식의 버전은 `SCHEMA_VERSION`으로 따로 관리한다(현재 `1`).
+스킬 버전이 올라가도 스키마가 그대로면 기존 `~/ClioData`는 손대지 않는다.
+
+**갱신 절차**
+
+```bash
+# 1) CLIO_VERSION 수정 → 2) CHANGELOG.md 맨 위에 항목 추가 → 3) 테스트
+python3 tests/test_clio.py
+# 4) 커밋 → 5) 태그 → 6) 릴리스
+git commit -am "..." && git tag -a v1.1.0 -m "v1.1.0" && git push origin main --tags
+gh release create v1.1.0 --title "v1.1.0" --notes "CHANGELOG.md의 해당 절 내용"
+```
+
+각 버전은 GitHub Releases에도 같은 내용으로 발행한다.
+
+---
+
+## 19. 기여
 
 이슈와 PR을 환영한다. 다만 이 프로젝트에는 **타협하지 않는 제약**이 몇 가지 있다.
 
@@ -1102,6 +1143,7 @@ v1의 범위 밖이다. DB 원본을 동기화 폴더에 두면 손상 위험이
 - [ ] 스키마를 바꿨다면 `references/schema.md`와 마이그레이션 경로를 함께 제시했다
 - [ ] 설정 키를 추가했다면 `clio_core.DEFAULT_CONFIG`와 이 README의 설정 표를 갱신했다
 - [ ] 외부 패키지를 추가하지 않았다
+- [ ] `CLIO_VERSION`을 올리고 `CHANGELOG.md`에 항목을 추가했다 ([§18](#18-버전-정책))
 
 ### 이슈를 올릴 때
 
@@ -1118,7 +1160,7 @@ v1의 범위 밖이다. DB 원본을 동기화 폴더에 두면 손상 위험이
 
 ---
 
-## 19. 라이선스
+## 20. 라이선스
 
 MIT License. 자세한 내용은 [LICENSE](LICENSE) 참조.
 
@@ -1136,10 +1178,11 @@ in the Software without restriction…
 
 | 문서 | 내용 |
 |---|---|
+| [`CHANGELOG.md`](CHANGELOG.md) | 버전별 변경 이력 |
 | [`SKILL.md`](SKILL.md) | 판단 계층 — 포착·질문·출력 규칙 |
 | [`references/schema.md`](references/schema.md) | 데이터 모델과 단일 원본 규칙 |
 | [`references/conversation-rules.md`](references/conversation-rules.md) | 표준 응답 문안 |
 | [`references/recovery-policy.md`](references/recovery-policy.md) | 삭제·백업·복구 정책 |
-| [`tests/test_clio.py`](tests/test_clio.py) | 저장 계층 테스트 27건 |
+| [`tests/test_clio.py`](tests/test_clio.py) | 저장 계층 테스트 28건 |
 | [`docs/PRD.md`](docs/PRD.md) | 설계 근거 문서 v1.3 (요구사항·결정 사항 D1~D7·성공 기준) |
 | [`docs/manual.md`](docs/manual.md) | 사용자용 설명서 (CLI 없이 대화만으로 쓰는 법) |

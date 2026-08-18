@@ -22,6 +22,20 @@ from pathlib import Path
 from zoneinfo import ZoneInfo
 
 # --------------------------------------------------------------------------
+# 버전
+# --------------------------------------------------------------------------
+#
+# 스킬 전체의 배포 버전 (SemVer). 동작이나 문서가 바뀌면 반드시 올리고
+# CHANGELOG.md에 항목을 남긴다. tests/test_clio.py가 둘의 일치를 검사한다.
+#
+#   MAJOR — 기존 데이터·명령 계약이 깨지는 변경
+#   MINOR — 명령·출력·규칙의 추가나 변경 (하위 호환)
+#   PATCH — 버그 수정, 문서 수정
+#
+# 데이터 파일 형식의 버전은 SCHEMA_VERSION으로 따로 관리한다.
+CLIO_VERSION = "1.1.0"
+
+# --------------------------------------------------------------------------
 # 설정 (PRD §11)
 # --------------------------------------------------------------------------
 
@@ -620,6 +634,8 @@ def read_body(args) -> str:
 
 def run_cli(build_parser, dispatch) -> None:
     parser = build_parser()
+    parser.add_argument("--version", action="version",
+                        version=f"clio-idea-manager {CLIO_VERSION}")
     args = parser.parse_args()
     if not getattr(args, "cmd", None):
         parser.print_help()

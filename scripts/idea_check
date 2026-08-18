@@ -15,7 +15,7 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from clio_core import (  # noqa: E402
-    ClioError, connect, data_dir, now_iso, run_cli, sha256_file, sha256_text,
+    CLIO_VERSION, ClioError, connect, data_dir, now_iso, run_cli, sha256_file, sha256_text,
 )
 
 COUNT_TABLES = ["idea", "raw_entry", "revision", "idea_relation", "tag", "idea_tag",
@@ -104,7 +104,8 @@ def run_integrity(conn) -> dict:
 
     counts = {t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"] for t in COUNT_TABLES}
     return {"healthy": not problems, "problem_count": len(problems), "problems": problems,
-            "unassigned_entries": unassigned, "counts": counts}
+            "unassigned_entries": unassigned, "counts": counts,
+            "clio_version": CLIO_VERSION}
 
 
 def cmd_init(args, cfg):
@@ -117,6 +118,7 @@ def cmd_init(args, cfg):
     counts = {t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
               for t in COUNT_TABLES}
     return {"data_dir": str(data_dir()), "created": not existed,
+            "clio_version": CLIO_VERSION,
             "schema_version": version["value"] if version else None, "counts": counts,
             "message": ("데이터베이스를 새로 만들었습니다." if not existed
                         else "기존 데이터베이스를 그대로 사용합니다.")}
