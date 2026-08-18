@@ -1,0 +1,128 @@
+#!/usr/bin/env python3
+"""idea_export — 내보내기 계층 (PRD §10, §9.3).
+
+SQLite가 원본이고 Markdown·JSON은 열람·백업용 출력이다 (PRD §2).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from clio_core import (  # noqa: E402
+    connect, data_dir, idea_tags, now_iso, ref_order_sql, run_cli,
+)
+
+
+def _collect(conn, include_deleted=False):
+    out = []
+    sql = "SELECT * FROM idea" + ("" if include_deleted else " WHERE deleted_at IS NULL")
+    for idea in conn.execute(sql + f" ORDER BY {ref_order_sql()}"):
+        entries = [dict(r) for r in conn.execute(
+            "SELECT * FROM raw_entry WHERE idea_id=? ORDER BY captured_at, id", (idea["id"],))]
+        revs = [dict(r) for r in conn.execute(
+            "SELECT * FROM revision WHERE idea_id=? ORDER BY rev_no", (idea["id"],))]
+        rels = [dict(r) for r in conn.execute(
+            "SELECT r.*, f.ref AS from_ref, t.ref AS to_ref FROM idea_relation r "
+            "JOIN idea f ON f.id=r.from_idea_id JOIN idea t ON t.id=r.to_idea_id "
+            "WHERE r.from_idea_id=? OR r.to_idea_id=?", (idea["id"], idea["id"]))]
+        atts = [dict(r) for r in conn.execute(
+            "SELECT a.* FROM attachment a JOIN raw_entry e ON e.id=a.raw_entry_id "
+            "WHERE e.idea_id=?", (idea["id"],))]
+        out.append({"idea": dict(idea), "tags": idea_tags(conn, idea["id"]),
+                    "raw_entries": entries, "revisions": revs, "relations": rels,
+                    "attachments": atts})
+    return out
+
+
+def cmd_json(args, cfg):
+    conn = connect(create=False)
+    out = Path(args.out).expanduser() if args.out else data_dir() / "exports" / "clio-export.json"
+    out.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"exported_at": now_iso(cfg), "schema_version": 1,
+               "unassigned": [dict(r) for r in conn.execute(
+                   "SELECT * FROM raw_entry WHERE idea_id IS NULL")],
+               "ideas": _collect(conn, args.include_deleted)}
+    out.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    return {"path": str(out), "ideas": len(payload["ideas"]),
+            "unassigned": len(payload["unassigned"])}
+
+
+def cmd_md(args, cfg):
+    conn = connect(create=False)
+    out = Path(args.out).expanduser() if args.out else data_dir() / "exports" / "markdown"
+    out.mkdir(parents=True, exist_ok=True)
+    written = []
+    items = _collect(conn, args.include_deleted)
+    for it in items:
+        idea, tags = it["idea"], it["tags"]
+        lines = [f"# {idea['ref']} — {idea['title']}", "",
+                 f"- 보관 상태: {idea['storage_state']}",
+                 f"- 발전 단계: {idea['dev_stage']}",
+                 f"- 생성일: {idea['created_at']}",
+                 f"- 최종 업데이트: {idea['updated_at']}",
+                 f"- 키워드: {', '.join(tags) or '-'}"]
+        parents = [r["to_ref"] for r in it["relations"]
+                   if r["rel_type"] == "derived_from" and r["from_ref"] == idea["ref"]]
+        derived = [r["from_ref"] for r in it["relations"]
+                   if r["rel_type"] == "derived_from" and r["to_ref"] == idea["ref"]]
+        others = [f"{r['to_ref'] if r['from_ref'] == idea['ref'] else r['from_ref']} ({r['rel_type']})"
+                  for r in it["relations"] if r["rel_type"] != "derived_from"]
+        lines += [f"- 부모 글감: {', '.join(parents) or '없음'}",
+                  f"- 파생 글감: {', '.join(derived) or '없음'}",
+                  f"- 관련 글감: {', '.join(others) or '없음'}", "",
+                  "## 원문 (교수님 작성 · 무수정)", ""]
+        for e in it["raw_entries"]:
+            lines.append(f"### {e['captured_at']}  ·  entry {e['id']}  ·  {e['entry_type']}")
+            lines.append("")
+            lines.append("*(영구 삭제됨)*" if e["redacted_at"] else e["body"])
+            lines.append("")
+        lines += ["## 정제본 (Clio 작성)", ""]
+        if it["revisions"]:
+            for r in it["revisions"]:
+                mark = " ← 최신" if r["id"] == idea["latest_revision_id"] else ""
+                lines += [f"### rev.{r['rev_no']} · {r['created_at']}{mark}", "",
+                          f"> 변경: {r['change_summary']}", "", r["body"], ""]
+        else:
+            lines += ["아직 없습니다.", ""]
+        if it["attachments"]:
+            lines += ["## 첨부", ""]
+            lines += [f"- `{a['stored_path']}` ({a['filename']})" for a in it["attachments"]]
+        path = out / f"{idea['ref']}.md"
+        path.write_text("\n".join(lines), encoding="utf-8")
+        written.append(path.name)
+
+    unassigned = [dict(r) for r in conn.execute(
+        "SELECT * FROM raw_entry WHERE idea_id IS NULL ORDER BY captured_at")]
+    idx = ["# Clio 글감 목록", "", f"생성: {now_iso(cfg)}", ""]
+    for it in items:
+        i = it["idea"]
+        idx.append(f"- [{i['ref']}]({i['ref']}.md) — {i['title']} "
+                   f"({i['storage_state']}/{i['dev_stage']}, 업데이트 {i['updated_at'][:10]})")
+    if unassigned:
+        idx += ["", "## 미분류 원문", ""]
+        idx += [f"- entry {u['id']} · {u['captured_at']} · "
+                f"{' '.join(u['body'].split())[:60]}" for u in unassigned]
+    (out / "index.md").write_text("\n".join(idx), encoding="utf-8")
+    return {"path": str(out), "files": len(written) + 1, "ideas": len(items)}
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="idea_export", description="Clio 내보내기")
+    sub = p.add_subparsers(dest="cmd")
+    j = sub.add_parser("json", help="JSON 전량 내보내기")
+    j.add_argument("--out")
+    j.add_argument("--include-deleted", action="store_true")
+    j.set_defaults(fn=cmd_json)
+    m = sub.add_parser("md", help="Markdown 내보내기 (Obsidian 열람용)")
+    m.add_argument("--out")
+    m.add_argument("--include-deleted", action="store_true")
+    m.set_defaults(fn=cmd_md)
+    return p
+
+
+if __name__ == "__main__":
+    run_cli(build_parser, lambda args, cfg: args.fn(args, cfg))

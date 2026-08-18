@@ -1,0 +1,700 @@
+#!/usr/bin/env python3
+"""idea_store — 쓰기 계층 (PRD §10).
+
+모든 명령은 단일 트랜잭션이다. 부분 저장을 허용하지 않는다 (TC2).
+성공 시 JSON과 종료 코드 0, 실패 시 오류 JSON과 종료 코드 1을 낸다.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import mimetypes
+import os
+import shutil
+import sys
+import urllib.request
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from clio_core import (  # noqa: E402
+    ClioError, DEV_STAGES, ENTRY_TYPES, REL_TYPES, STORAGE_STATES, SYMMETRIC_TYPES,
+    connect, data_dir, day_of, get_entry, get_idea, idea_tags, log_action, next_ref,
+    now_iso, parse_trigger, read_body, reindex, resolve_tag, run_cli, score_candidates,
+    sha256_file, sha256_text, touch_idea, tx,
+)
+
+# --------------------------------------------------------------------------
+# capture — 트랜잭션 A (PRD §6.2 3단계)
+# --------------------------------------------------------------------------
+
+def find_duplicate(conn, cfg, platform, message_id, body_hash, captured_at):
+    """D7 2단 멱등성 규칙.
+
+    1) message_id가 있으면 (platform, message_id)로 판정한다.
+    2) 없으면 (body_hash, 같은 날짜)로 판정한다.
+    """
+    if message_id:
+        src = conn.execute(
+            "SELECT id FROM source WHERE platform = ? AND message_id = ?",
+            (platform, message_id),
+        ).fetchone()
+        if src:
+            row = conn.execute(
+                "SELECT * FROM raw_entry WHERE source_id = ?", (src["id"],)
+            ).fetchone()
+            if row:
+                return row, "message_id"
+        return None, None
+    row = conn.execute(
+        "SELECT * FROM raw_entry WHERE body_hash = ? AND substr(captured_at,1,10) = ?",
+        (body_hash, day_of(captured_at)),
+    ).fetchone()
+    return (row, "body_hash_same_day") if row else (None, None)
+
+
+def store_attachment(conn, cfg, raw_entry_id, src, ts, is_url=False):
+    """D6 — 원본을 내려받아 sha256 파일명으로 복사 보관한다."""
+    att_dir = data_dir() / "attachments"
+    tmp = att_dir / ".incoming"
+    tmp.mkdir(parents=True, exist_ok=True)
+    if is_url:
+        name = os.path.basename(src.split("?")[0]) or "attachment"
+        staged = tmp / name
+        with urllib.request.urlopen(src, timeout=30) as resp, staged.open("wb") as fh:
+            shutil.copyfileobj(resp, fh)
+        source_url = src
+    else:
+        p = Path(src).expanduser()
+        if not p.is_file():
+            raise ClioError("attachment_missing", f"첨부파일이 없습니다: {src}")
+        name = p.name
+        staged = tmp / name
+        shutil.copyfile(p, staged)
+        source_url = None
+    digest = sha256_file(staged)
+    ext = Path(name).suffix
+    dest_dir = att_dir / digest[:2]
+    dest_dir.mkdir(parents=True, exist_ok=True)
+    dest = dest_dir / f"{digest}{ext}"
+    if not dest.exists():
+        shutil.move(str(staged), str(dest))
+    else:
+        staged.unlink(missing_ok=True)
+    rel = str(dest.relative_to(data_dir()))
+    conn.execute(
+        "INSERT OR IGNORE INTO attachment"
+        "(raw_entry_id,filename,mime_type,byte_size,sha256,stored_path,source_url,fetched_at)"
+        " VALUES(?,?,?,?,?,?,?,?)",
+        (raw_entry_id, name, mimetypes.guess_type(name)[0], dest.stat().st_size,
+         digest, rel, source_url, ts),
+    )
+    return {"filename": name, "sha256": digest, "stored_path": rel}
+
+
+def cmd_parse(args, cfg):
+    """지시어 판정만 수행한다. 데이터베이스를 건드리지 않는다 (PRD §6.1)."""
+    return parse_trigger(args.message)
+
+
+def cmd_capture(args, cfg):
+    trigger = None
+    if args.raw_message is not None:
+        # 저장 지시어를 저장 계층에서 강제한다. 지시어가 없으면 아무것도 쓰지 않는다.
+        trigger = parse_trigger(args.raw_message)
+        if not trigger["trigger"]:
+            raise ClioError("no_trigger", trigger["reason"], parsed=trigger)
+        if trigger["kind"] == "retro":
+            raise ClioError(
+                "retro_needs_body",
+                "소급 저장은 직전 메시지 원문을 --body로 함께 넘겨야 합니다. "
+                "맥락에서 원문을 그대로 복원할 수 없으면 저장하지 마세요.",
+                parsed=trigger)
+        if trigger.get("empty"):
+            raise ClioError("empty_body", "지시어만 있고 본문이 없습니다. 저장하지 않았습니다.",
+                            parsed=trigger)
+        args.body = trigger["body"]
+        args.body_file = None
+    body = read_body(args)
+    body_hash = sha256_text(body)
+    conn = connect()
+    ts = now_iso(cfg)
+    captured = args.captured_at or ts
+
+    with tx(conn):
+        dup, how = find_duplicate(conn, cfg, args.platform, args.message_id, body_hash, captured)
+        if dup and not args.force:
+            dup_ref = None
+            if dup["idea_id"]:
+                dup_ref = conn.execute(
+                    "SELECT ref FROM idea WHERE id = ?", (dup["idea_id"],)
+                ).fetchone()["ref"]
+            return {
+                "entry_id": dup["id"], "duplicate": True, "duplicate_by": how,
+                "assign_state": dup["assign_state"], "idea_ref": dup_ref,
+                "message": "이미 저장된 원문입니다. 새로 저장하지 않았습니다.",
+            }
+        src_id = conn.execute(
+            "INSERT INTO source(platform,guild_id,channel_id,thread_id,message_id,"
+            "author_id,reply_to_id,edited,raw_payload) VALUES(?,?,?,?,?,?,?,?,?)",
+            (args.platform, args.guild_id, args.channel_id, args.thread_id,
+             args.message_id, args.author_id, args.reply_to_id,
+             1 if args.edited else 0, args.raw_payload),
+        ).lastrowid
+        entry_id = conn.execute(
+            "INSERT INTO raw_entry(idea_id,assign_state,body,body_hash,entry_type,"
+            "captured_at,ingested_at,source_id) VALUES(NULL,'unassigned',?,?,?,?,?,?)",
+            (body, body_hash, args.type, captured, ts, src_id),
+        ).lastrowid
+        attached = []
+        for a in (args.attach or []):
+            attached.append(store_attachment(conn, cfg, entry_id, a, ts, is_url=False))
+        for a in (args.attach_url or []):
+            attached.append(store_attachment(conn, cfg, entry_id, a, ts, is_url=True))
+        log_action(conn, "capture", f"raw_entry:{entry_id}",
+                   {"undo": [], "body_hash": body_hash, "source_id": src_id}, ts)
+
+    return {"entry_id": entry_id, "duplicate": False, "assign_state": "unassigned",
+            "captured_at": captured, "body_hash": body_hash, "attachments": attached,
+            "trigger": trigger,
+            "message": "원문을 보존했습니다. 아직 글감에 배정되지 않았습니다."}
+
+
+# --------------------------------------------------------------------------
+# 글감 생성·배정
+# --------------------------------------------------------------------------
+
+def _title_from(body: str) -> str:
+    line = next((l.strip() for l in body.splitlines() if l.strip()), "제목 없음")
+    return line[:60]
+
+
+def _apply_tags(conn, idea_id, names):
+    for name in names:
+        tid = resolve_tag(conn, name)
+        if tid:
+            conn.execute("INSERT OR IGNORE INTO idea_tag(idea_id,tag_id) VALUES(?,?)",
+                         (idea_id, tid))
+
+
+def cmd_new_idea(args, cfg):
+    conn = connect()
+    ts = now_iso(cfg)
+    tags = [t for t in (args.tags or "").split(",") if t.strip()]
+    with tx(conn):
+        entry = None
+        if args.entry_id:
+            entry = get_entry(conn, args.entry_id)
+            if entry["assign_state"] == "assigned" and not args.force:
+                raise ClioError("already_assigned",
+                                f"이미 배정된 원문입니다 (entry {args.entry_id}). "
+                                "옮기려면 reassign을 사용하세요.")
+        title = args.title or (_title_from(entry["body"]) if entry else None)
+        if not title:
+            raise ClioError("no_title", "제목이 필요합니다 (--title 또는 --entry-id).")
+        ref = next_ref(conn, cfg)
+        idea_id = conn.execute(
+            "INSERT INTO idea(ref,title,storage_state,dev_stage,created_at,updated_at)"
+            " VALUES(?,?,?,?,?,?)",
+            (ref, title, args.storage, args.stage, ts, ts),
+        ).lastrowid
+        undo = [{"op": "tombstone_idea", "idea_id": idea_id}]
+        if entry:
+            conn.execute(
+                "UPDATE raw_entry SET idea_id = ?, assign_state = 'assigned' WHERE id = ?",
+                (idea_id, entry["id"]))
+            undo.insert(0, {"op": "restore_entry", "entry_id": entry["id"],
+                            "idea_id": entry["idea_id"],
+                            "assign_state": entry["assign_state"]})
+        _apply_tags(conn, idea_id, tags)
+        reindex(conn, idea_id)
+        log_action(conn, "new_idea", f"idea:{idea_id}",
+                   {"undo": undo, "ref": ref, "entry_id": args.entry_id}, ts)
+    return {"ref": ref, "idea_id": idea_id, "title": title, "entry_id": args.entry_id,
+            "storage_state": args.storage, "dev_stage": args.stage, "tags": tags}
+
+
+def cmd_assign(args, cfg):
+    conn = connect()
+    ts = now_iso(cfg)
+    with tx(conn):
+        entry = get_entry(conn, args.entry_id)
+        idea = get_idea(conn, args.idea_ref)
+        if entry["assign_state"] == "assigned" and not args.force:
+            raise ClioError("already_assigned",
+                            f"이미 배정된 원문입니다 (entry {args.entry_id}). "
+                            "옮기려면 reassign을 사용하세요.")
+        conn.execute("UPDATE raw_entry SET idea_id = ?, assign_state = 'assigned' WHERE id = ?",
+                     (idea["id"], entry["id"]))
+        touch_idea(conn, idea["id"], ts)
+        reindex(conn, idea["id"])
+        log_action(conn, "assign", f"raw_entry:{entry['id']}",
+                   {"undo": [{"op": "restore_entry", "entry_id": entry["id"],
+                              "idea_id": entry["idea_id"],
+                              "assign_state": entry["assign_state"]},
+                             {"op": "set_updated_at", "idea_id": idea["id"],
+                              "ts": idea["updated_at"]}],
+                    "idea_ref": idea["ref"], "entry_id": entry["id"]}, ts)
+    return {"entry_id": entry["id"], "ref": idea["ref"], "title": idea["title"],
+            "message": f"{idea['ref']}에 새 원문을 추가했습니다."}
+
+
+def cmd_reassign(args, cfg):
+    conn = connect()
+    ts = now_iso(cfg)
+    with tx(conn):
+        entry = get_entry(conn, args.entry_id)
+        target = get_idea(conn, args.to_idea_ref)
+        old_id = entry["idea_id"]
+        old_ref = None
+        if old_id:
+            old_ref = conn.execute("SELECT ref FROM idea WHERE id = ?", (old_id,)).fetchone()["ref"]
+        conn.execute("UPDATE raw_entry SET idea_id = ?, assign_state = 'assigned' WHERE id = ?",
+                     (target["id"], entry["id"]))
+        touch_idea(conn, target["id"], ts)
+        reindex(conn, target["id"])
+        if old_id:
+            touch_idea(conn, old_id, ts)
+            reindex(conn, old_id)
+        log_action(conn, "reassign", f"raw_entry:{entry['id']}",
+                   {"undo": [{"op": "restore_entry", "entry_id": entry["id"],
+                              "idea_id": old_id, "assign_state": entry["assign_state"]}],
+                    "from": old_ref, "to": target["ref"]}, ts)
+    return {"entry_id": entry["id"], "from": old_ref, "to": target["ref"],
+            "message": f"원문 {entry['id']}을 {old_ref or '미분류'}에서 {target['ref']}로 옮겼습니다."}
+
+
+# --------------------------------------------------------------------------
+# 정제본 (D5 — 명시적 요청 시에만)
+# --------------------------------------------------------------------------
+
+def cmd_revise(args, cfg):
+    body = read_body(args)
+    conn = connect()
+    ts = now_iso(cfg)
+    with tx(conn):
+        idea = get_idea(conn, args.idea_ref)
+        prev = conn.execute("SELECT MAX(rev_no) AS n FROM revision WHERE idea_id = ?",
+                            (idea["id"],)).fetchone()["n"] or 0
+        rev_no = prev + 1
+        rev_id = conn.execute(
+            "INSERT INTO revision(idea_id,rev_no,body,change_summary,author,created_at)"
+            " VALUES(?,?,?,?,?,?)",
+            (idea["id"], rev_no, body, args.summary, args.author, ts),
+        ).lastrowid
+        conn.execute("UPDATE idea SET latest_revision_id = ?, updated_at = ?, "
+                     "dev_stage = CASE WHEN dev_stage = 'fragment' THEN 'developed' "
+                     "ELSE dev_stage END WHERE id = ?", (rev_id, ts, idea["id"]))
+        reindex(conn, idea["id"])
+        log_action(conn, "revise", f"idea:{idea['id']}",
+                   {"undo": [{"op": "set_latest_revision", "idea_id": idea["id"],
+                              "revision_id": idea["latest_revision_id"]},
+                             {"op": "set_state", "idea_id": idea["id"],
+                              "storage": idea["storage_state"], "stage": idea["dev_stage"]},
+                             {"op": "set_updated_at", "idea_id": idea["id"],
+                              "ts": idea["updated_at"]}],
+                    "rev_no": rev_no, "revision_id": rev_id}, ts)
+    return {"ref": idea["ref"], "rev_no": rev_no, "revision_id": rev_id,
+            "message": f"원문은 그대로 보존하고 정제본 revision {rev_no}를 만들었습니다."}
+
+
+# --------------------------------------------------------------------------
+# 관계·합성·분리
+# --------------------------------------------------------------------------
+
+def _insert_relation(conn, cfg, ts, a_id, b_id, rel_type, rationale, confidence, by, confirmed):
+    sym = 1 if rel_type in SYMMETRIC_TYPES else 0
+    frm, to = (min(a_id, b_id), max(a_id, b_id)) if sym else (a_id, b_id)
+    if frm == to:
+        raise ClioError("self_relation", "같은 글감끼리는 관계를 만들 수 없습니다.")
+    existing = conn.execute(
+        "SELECT id FROM idea_relation WHERE from_idea_id=? AND to_idea_id=? AND rel_type=?",
+        (frm, to, rel_type)).fetchone()
+    if existing:
+        return existing["id"], True
+    rid = conn.execute(
+        "INSERT INTO idea_relation(from_idea_id,to_idea_id,rel_type,symmetric,created_at,"
+        "created_by,rationale,confidence,confirmed_by_user) VALUES(?,?,?,?,?,?,?,?,?)",
+        (frm, to, rel_type, sym, ts, by, rationale, confidence, 1 if confirmed else 0),
+    ).lastrowid
+    return rid, False
+
+
+def cmd_relate(args, cfg):
+    conn = connect()
+    ts = now_iso(cfg)
+    with tx(conn):
+        a = get_idea(conn, args.from_ref)
+        b = get_idea(conn, args.to_ref)
+        rid, existed = _insert_relation(conn, cfg, ts, a["id"], b["id"], args.type,
+                                        args.rationale, args.confidence, args.by,
+                                        args.confirmed)
+        if not existed:
+            log_action(conn, "relate", f"idea_relation:{rid}",
+                       {"undo": [{"op": "delete_relation", "relation_id": rid}],
+                        "from": a["ref"], "to": b["ref"], "type": args.type}, ts)
+    return {"relation_id": rid, "existed": existed, "from": a["ref"], "to": b["ref"],
+            "type": args.type, "symmetric": args.type in SYMMETRIC_TYPES}
+
+
+def cmd_merge(args, cfg):
+    """합성 글감. 새 번호를 발급하고 부모는 그대로 유지한다 (TC4)."""
+    refs = [r.strip() for r in args.parents.split(",") if r.strip()]
+    if len(refs) < 2:
+        raise ClioError("need_parents", "합성에는 부모 글감이 2개 이상 필요합니다.")
+    conn = connect()
+    ts = now_iso(cfg)
+    with tx(conn):
+        parents = [get_idea(conn, r) for r in refs]
+        ref = next_ref(conn, cfg)
+        idea_id = conn.execute(
+            "INSERT INTO idea(ref,title,storage_state,dev_stage,created_at,updated_at)"
+            " VALUES(?,?,'active','fragment',?,?)", (ref, args.title, ts, ts)).lastrowid
+        undo = [{"op": "tombstone_idea", "idea_id": idea_id}]
+        for p in parents:
+            rid, _ = _insert_relation(conn, cfg, ts, idea_id, p["id"], "derived_from",
+                                      args.rationale or f"{args.title} 합성", None,
+                                      args.by, True)
+            undo.insert(0, {"op": "delete_relation", "relation_id": rid})
+        _apply_tags(conn, idea_id, [t for t in (args.tags or "").split(",") if t.strip()])
+        reindex(conn, idea_id)
+        log_action(conn, "merge", f"idea:{idea_id}",
+                   {"undo": undo, "ref": ref, "parents": refs}, ts)
+    return {"ref": ref, "idea_id": idea_id, "title": args.title, "parents": refs,
+            "message": f"{ref}을 만들었습니다. 부모 글감 {', '.join(refs)}은 그대로 유지됩니다."}
+
+
+def cmd_split(args, cfg):
+    ids = [int(x) for x in args.entry_ids.split(",") if x.strip()]
+    if not ids:
+        raise ClioError("need_entries", "분리할 원문 번호가 필요합니다.")
+    conn = connect()
+    ts = now_iso(cfg)
+    with tx(conn):
+        entries = [get_entry(conn, i) for i in ids]
+        ref = next_ref(conn, cfg)
+        title = args.title or _title_from(entries[0]["body"])
+        idea_id = conn.execute(
+            "INSERT INTO idea(ref,title,storage_state,dev_stage,created_at,updated_at)"
+            " VALUES(?,?,'active','fragment',?,?)", (ref, title, ts, ts)).lastrowid
+        undo = [{"op": "tombstone_idea", "idea_id": idea_id}]
+        touched = set()
+        for e in entries:
+            undo.insert(0, {"op": "restore_entry", "entry_id": e["id"],
+                            "idea_id": e["idea_id"], "assign_state": e["assign_state"]})
+            if e["idea_id"]:
+                touched.add(e["idea_id"])
+            conn.execute("UPDATE raw_entry SET idea_id=?, assign_state='assigned' WHERE id=?",
+                         (idea_id, e["id"]))
+        if args.link_parent:
+            for src in touched:
+                rid, _ = _insert_relation(conn, cfg, ts, idea_id, src, "derived_from",
+                                          "원문 분리", None, args.by, True)
+                undo.insert(0, {"op": "delete_relation", "relation_id": rid})
+        reindex(conn, idea_id)
+        for t in touched:
+            reindex(conn, t)
+        log_action(conn, "split", f"idea:{idea_id}",
+                   {"undo": undo, "ref": ref, "entry_ids": ids}, ts)
+    return {"ref": ref, "idea_id": idea_id, "title": title, "entry_ids": ids}
+
+
+# --------------------------------------------------------------------------
+# 상태·태그
+# --------------------------------------------------------------------------
+
+def cmd_set_state(args, cfg):
+    conn = connect()
+    ts = now_iso(cfg)
+    with tx(conn):
+        idea = get_idea(conn, args.idea_ref)
+        storage = args.storage or idea["storage_state"]
+        stage = args.stage or idea["dev_stage"]
+        conn.execute("UPDATE idea SET storage_state=?, dev_stage=?, updated_at=? WHERE id=?",
+                     (storage, stage, ts, idea["id"]))
+        log_action(conn, "set_state", f"idea:{idea['id']}",
+                   {"undo": [{"op": "set_state", "idea_id": idea["id"],
+                              "storage": idea["storage_state"], "stage": idea["dev_stage"]},
+                             {"op": "set_updated_at", "idea_id": idea["id"],
+                              "ts": idea["updated_at"]}]}, ts)
+    return {"ref": idea["ref"], "storage_state": storage, "dev_stage": stage}
+
+
+def cmd_tag(args, cfg):
+    conn = connect()
+    ts = now_iso(cfg)
+    with tx(conn):
+        if args.alias:
+            old, new = args.alias.split("=", 1)
+            old_id = resolve_tag(conn, old, create=False)
+            new_id = resolve_tag(conn, new, create=True)
+            if not old_id:
+                raise ClioError("tag_not_found", f"태그를 찾을 수 없습니다: {old}")
+            conn.execute("UPDATE tag SET alias_of=? WHERE id=?", (new_id, old_id))
+            conn.execute("UPDATE OR IGNORE idea_tag SET tag_id=? WHERE tag_id=?",
+                         (new_id, old_id))
+            conn.execute("DELETE FROM idea_tag WHERE tag_id=?", (old_id,))
+            for (iid,) in conn.execute("SELECT DISTINCT idea_id FROM idea_tag WHERE tag_id=?",
+                                       (new_id,)):
+                reindex(conn, iid)
+            log_action(conn, "tag_alias", f"tag:{old_id}", {"undo": []}, ts)
+            return {"alias": {old: new}}
+        idea = get_idea(conn, args.idea_ref)
+        undo = []
+        added, removed = [], []
+        for name in [t for t in (args.add or "").split(",") if t.strip()]:
+            tid = resolve_tag(conn, name)
+            cur = conn.execute("SELECT 1 FROM idea_tag WHERE idea_id=? AND tag_id=?",
+                               (idea["id"], tid)).fetchone()
+            if not cur:
+                conn.execute("INSERT INTO idea_tag(idea_id,tag_id) VALUES(?,?)",
+                             (idea["id"], tid))
+                undo.append({"op": "tag_remove", "idea_id": idea["id"], "tag_id": tid})
+                added.append(name.strip())
+        for name in [t for t in (args.remove or "").split(",") if t.strip()]:
+            tid = resolve_tag(conn, name, create=False)
+            if tid:
+                conn.execute("DELETE FROM idea_tag WHERE idea_id=? AND tag_id=?",
+                             (idea["id"], tid))
+                undo.append({"op": "tag_add", "idea_id": idea["id"], "tag_id": tid})
+                removed.append(name.strip())
+        reindex(conn, idea["id"])
+        log_action(conn, "tag", f"idea:{idea['id']}", {"undo": undo}, ts)
+    return {"ref": idea["ref"], "added": added, "removed": removed,
+            "tags": idea_tags(conn, idea["id"])}
+
+
+# --------------------------------------------------------------------------
+# 삭제 (PRD §9.2)
+# --------------------------------------------------------------------------
+
+def cmd_redact(args, cfg):
+    if not args.confirm:
+        raise ClioError("confirm_required",
+                        "영구 삭제는 --confirm이 필요합니다. 일반 삭제 요청은 "
+                        "set-state --storage archived로 처리하세요.")
+    conn = connect()
+    ts = now_iso(cfg)
+    with tx(conn):
+        entry = get_entry(conn, args.entry_id)
+        conn.execute("UPDATE raw_entry SET body='', redacted_at=? WHERE id=?",
+                     (ts, entry["id"]))
+        conn.execute("UPDATE attachment SET redacted_at=? WHERE raw_entry_id=?",
+                     (ts, entry["id"]))
+        for r in conn.execute("SELECT stored_path FROM attachment WHERE raw_entry_id=?",
+                              (entry["id"],)):
+            p = data_dir() / r["stored_path"]
+            if p.exists():
+                p.unlink()
+        if entry["idea_id"]:
+            reindex(conn, entry["idea_id"])
+        log_action(conn, "redact", f"raw_entry:{entry['id']}",
+                   {"undo": [], "reason": args.reason}, ts)
+    return {"entry_id": entry["id"], "redacted_at": ts, "reversible": False,
+            "message": "원문을 영구 삭제했습니다. 삭제 사실과 시각만 tombstone으로 남습니다."}
+
+
+def cmd_delete_idea(args, cfg):
+    if not args.confirm:
+        raise ClioError("confirm_required", "글감 영구 삭제는 --confirm이 필요합니다.")
+    conn = connect()
+    ts = now_iso(cfg)
+    with tx(conn):
+        idea = get_idea(conn, args.idea_ref)
+        conn.execute("UPDATE idea SET deleted_at=? WHERE id=?", (ts, idea["id"]))
+        conn.execute("DELETE FROM search_fts WHERE rowid=?", (idea["id"],))
+        log_action(conn, "delete_idea", f"idea:{idea['id']}",
+                   {"undo": [], "reason": args.reason, "ref": idea["ref"]}, ts)
+    return {"ref": idea["ref"], "deleted_at": ts,
+            "message": f"{idea['ref']}을 tombstone 처리했습니다. 번호는 재사용하지 않습니다."}
+
+
+# --------------------------------------------------------------------------
+# undo (PRD §6.5)
+# --------------------------------------------------------------------------
+
+UNDOABLE = {"assign", "new_idea", "reassign", "revise", "relate", "merge", "split",
+            "set_state", "tag"}
+
+
+def cmd_undo(args, cfg):
+    conn = connect()
+    ts = now_iso(cfg)
+    with tx(conn):
+        if args.action_id:
+            row = conn.execute("SELECT * FROM action_log WHERE id=?", (args.action_id,)).fetchone()
+        else:
+            row = conn.execute(
+                "SELECT * FROM action_log WHERE undone_at IS NULL AND action IN (%s)"
+                " ORDER BY id DESC LIMIT 1" % ",".join("?" * len(UNDOABLE)),
+                tuple(UNDOABLE)).fetchone()
+        if row is None:
+            raise ClioError("nothing_to_undo", "취소할 작업이 없습니다.")
+        if row["undone_at"]:
+            raise ClioError("already_undone", f"이미 취소된 작업입니다 (action {row['id']}).")
+        if row["action"] not in UNDOABLE:
+            raise ClioError("not_undoable",
+                            f"취소할 수 없는 작업입니다: {row['action']}. "
+                            "영구 삭제와 원문 저장은 되돌리지 않습니다.")
+        payload = json.loads(row["payload"])
+        touched = set()
+        for op in payload.get("undo", []):
+            kind = op["op"]
+            if kind == "restore_entry":
+                conn.execute("UPDATE raw_entry SET idea_id=?, assign_state=? WHERE id=?",
+                             (op["idea_id"], op["assign_state"], op["entry_id"]))
+                if op["idea_id"]:
+                    touched.add(op["idea_id"])
+            elif kind == "tombstone_idea":
+                conn.execute("UPDATE idea SET deleted_at=? WHERE id=?", (ts, op["idea_id"]))
+                conn.execute("DELETE FROM search_fts WHERE rowid=?", (op["idea_id"],))
+            elif kind == "delete_relation":
+                conn.execute("DELETE FROM idea_relation WHERE id=?", (op["relation_id"],))
+            elif kind == "set_latest_revision":
+                conn.execute("UPDATE idea SET latest_revision_id=? WHERE id=?",
+                             (op["revision_id"], op["idea_id"]))
+                touched.add(op["idea_id"])
+            elif kind == "set_state":
+                conn.execute("UPDATE idea SET storage_state=?, dev_stage=? WHERE id=?",
+                             (op["storage"], op["stage"], op["idea_id"]))
+            elif kind == "set_updated_at":
+                conn.execute("UPDATE idea SET updated_at=? WHERE id=?",
+                             (op["ts"], op["idea_id"]))
+            elif kind == "tag_add":
+                conn.execute("INSERT OR IGNORE INTO idea_tag(idea_id,tag_id) VALUES(?,?)",
+                             (op["idea_id"], op["tag_id"]))
+                touched.add(op["idea_id"])
+            elif kind == "tag_remove":
+                conn.execute("DELETE FROM idea_tag WHERE idea_id=? AND tag_id=?",
+                             (op["idea_id"], op["tag_id"]))
+                touched.add(op["idea_id"])
+            else:
+                raise ClioError("unknown_undo_op", f"알 수 없는 취소 연산: {kind}")
+        for t in touched:
+            alive = conn.execute("SELECT deleted_at FROM idea WHERE id=?", (t,)).fetchone()
+            if alive and not alive["deleted_at"]:
+                reindex(conn, t)
+        conn.execute("UPDATE action_log SET undone_at=? WHERE id=?", (ts, row["id"]))
+        log_action(conn, "undo", row["target"], {"undo": [], "undone_action": row["id"]}, ts)
+    return {"undone_action_id": row["id"], "action": row["action"], "target": row["target"],
+            "message": f"직전 작업({row['action']})을 취소했습니다."}
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="idea_store", description="Clio 아이디어 저장 계층")
+    sub = p.add_subparsers(dest="cmd")
+
+    pr = sub.add_parser("parse", help="저장 지시어 판정 (§6.1, 쓰기 없음)")
+    pr.add_argument("--message", required=True)
+    pr.set_defaults(fn=cmd_parse)
+
+    c = sub.add_parser("capture", help="원문 저장 (트랜잭션 A)")
+    c.add_argument("--raw-message", help="Discord 메시지 원본. 지시어를 저장 계층이 판정한다")
+    c.add_argument("--body")
+    c.add_argument("--body-file")
+    c.add_argument("--platform", default="discord")
+    c.add_argument("--message-id")
+    c.add_argument("--guild-id")
+    c.add_argument("--channel-id")
+    c.add_argument("--thread-id")
+    c.add_argument("--author-id")
+    c.add_argument("--reply-to-id")
+    c.add_argument("--edited", action="store_true")
+    c.add_argument("--raw-payload")
+    c.add_argument("--captured-at")
+    c.add_argument("--type", choices=ENTRY_TYPES, default="idea")
+    c.add_argument("--attach", action="append")
+    c.add_argument("--attach-url", action="append")
+    c.add_argument("--force", action="store_true", help="중복 판정 우회 (D7)")
+    c.set_defaults(fn=cmd_capture)
+
+    n = sub.add_parser("new-idea", help="새 글감 생성")
+    n.add_argument("--title")
+    n.add_argument("--entry-id", type=int)
+    n.add_argument("--tags")
+    n.add_argument("--storage", choices=STORAGE_STATES, default="active")
+    n.add_argument("--stage", choices=DEV_STAGES, default="fragment")
+    n.add_argument("--force", action="store_true")
+    n.set_defaults(fn=cmd_new_idea)
+
+    a = sub.add_parser("assign", help="원문을 글감에 배정")
+    a.add_argument("--entry-id", type=int, required=True)
+    a.add_argument("--idea-ref", required=True)
+    a.add_argument("--force", action="store_true")
+    a.set_defaults(fn=cmd_assign)
+
+    r = sub.add_parser("reassign", help="잘못 연결된 원문 이동")
+    r.add_argument("--entry-id", type=int, required=True)
+    r.add_argument("--to-idea-ref", required=True)
+    r.set_defaults(fn=cmd_reassign)
+
+    v = sub.add_parser("revise", help="정제본 revision 추가 (D5: 명시 요청 시에만)")
+    v.add_argument("--idea-ref", required=True)
+    v.add_argument("--body")
+    v.add_argument("--body-file")
+    v.add_argument("--summary", required=True)
+    v.add_argument("--author", choices=["clio", "user"], default="clio")
+    v.set_defaults(fn=cmd_revise)
+
+    l = sub.add_parser("relate", help="글감 관계 설정")
+    l.add_argument("--from", dest="from_ref", required=True)
+    l.add_argument("--to", dest="to_ref", required=True)
+    l.add_argument("--type", choices=REL_TYPES, required=True)
+    l.add_argument("--rationale")
+    l.add_argument("--confidence", type=float)
+    l.add_argument("--by", choices=["user", "clio"], default="clio")
+    l.add_argument("--confirmed", action="store_true")
+    l.set_defaults(fn=cmd_relate)
+
+    m = sub.add_parser("merge", help="합성 글감 생성 (부모 유지)")
+    m.add_argument("--parents", required=True, help="CLIO-0003,CLIO-0007")
+    m.add_argument("--title", required=True)
+    m.add_argument("--tags")
+    m.add_argument("--rationale")
+    m.add_argument("--by", choices=["user", "clio"], default="user")
+    m.set_defaults(fn=cmd_merge)
+
+    s = sub.add_parser("split", help="일부 원문을 새 글감으로 분리")
+    s.add_argument("--entry-ids", required=True)
+    s.add_argument("--title")
+    s.add_argument("--link-parent", action="store_true")
+    s.add_argument("--by", choices=["user", "clio"], default="user")
+    s.set_defaults(fn=cmd_split)
+
+    t = sub.add_parser("set-state", help="보관 상태·발전 단계 변경")
+    t.add_argument("--idea-ref", required=True)
+    t.add_argument("--storage", choices=STORAGE_STATES)
+    t.add_argument("--stage", choices=DEV_STAGES)
+    t.set_defaults(fn=cmd_set_state)
+
+    g = sub.add_parser("tag", help="태그 추가·제거·통합")
+    g.add_argument("--idea-ref")
+    g.add_argument("--add")
+    g.add_argument("--remove")
+    g.add_argument("--alias", help="옛이름=새이름")
+    g.set_defaults(fn=cmd_tag)
+
+    u = sub.add_parser("undo", help="직전 작업 취소")
+    u.add_argument("--action-id", type=int)
+    u.set_defaults(fn=cmd_undo)
+
+    d = sub.add_parser("redact", help="원문 영구 삭제 (PRD §9.2)")
+    d.add_argument("--entry-id", type=int, required=True)
+    d.add_argument("--reason", required=True)
+    d.add_argument("--confirm", action="store_true")
+    d.set_defaults(fn=cmd_redact)
+
+    x = sub.add_parser("delete-idea", help="글감 tombstone 처리")
+    x.add_argument("--idea-ref", required=True)
+    x.add_argument("--reason", required=True)
+    x.add_argument("--confirm", action="store_true")
+    x.set_defaults(fn=cmd_delete_idea)
+    return p
+
+
+if __name__ == "__main__":
+    run_cli(build_parser, lambda args, cfg: args.fn(args, cfg))

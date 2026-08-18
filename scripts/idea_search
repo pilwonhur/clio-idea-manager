@@ -1,0 +1,328 @@
+#!/usr/bin/env python3
+"""idea_search — 읽기 계층 (PRD §10). 데이터베이스를 변경하지 않는다.
+
+예외: similar은 D1 임계값 조정 근거를 남기기 위해 후보 제시 이력을 action_log에
+기록한다 (idea_check calibrate가 이 기록을 사용한다).
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import sys
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from clio_core import (  # noqa: E402
+    ClioError, DEV_STAGES, STORAGE_STATES, connect, decide, get_entry, get_idea,
+    idea_tags, log_action, now_iso, ref_order_sql, run_cli, score_candidates, tx,
+)
+
+
+def _flat(text, width=90):
+    flat = " ".join(text.split())
+    return flat if len(flat) <= width else flat[:width] + "…"
+
+
+def _preview(conn, idea_id, width=90):
+    """줄바꿈을 제거한 원문 한두 줄 (PRD §8.3).
+
+    합성 글감처럼 자체 원문이 없는 경우 정제본, 그다음 부모 글감을 대신 보여준다.
+    빈 줄을 내보내면 목록에서 그 글감이 무엇인지 알 수 없다.
+    """
+    row = conn.execute(
+        "SELECT body FROM raw_entry WHERE idea_id=? AND redacted_at IS NULL "
+        "ORDER BY captured_at LIMIT 1", (idea_id,)).fetchone()
+    if row:
+        return _flat(row["body"], width)
+    rev = conn.execute(
+        "SELECT r.body FROM revision r JOIN idea i ON i.latest_revision_id = r.id "
+        "WHERE i.id = ?", (idea_id,)).fetchone()
+    if rev:
+        return _flat(rev["body"], width)
+    parents = [r["ref"] for r in conn.execute(
+        "SELECT t.ref FROM idea_relation r JOIN idea t ON t.id = r.to_idea_id "
+        "WHERE r.from_idea_id = ? AND r.rel_type = 'derived_from' "
+        f"ORDER BY {ref_order_sql('t.ref')}",
+        (idea_id,))]
+    if parents:
+        return f"(자체 원문 없음 · 부모 글감 {', '.join(parents)})"
+    return "(원문 없음)"
+
+
+def _record_dates(conn, idea_id):
+    dates = set()
+    for r in conn.execute("SELECT captured_at FROM raw_entry WHERE idea_id=?", (idea_id,)):
+        dates.add(r["captured_at"][:10])
+    for r in conn.execute("SELECT created_at FROM revision WHERE idea_id=?", (idea_id,)):
+        dates.add(r["created_at"][:10])
+    return sorted(dates)
+
+
+def _relations(conn, idea_id):
+    """관계의 단일 원본은 idea_relation이다. 부모·파생은 조회 시 계산한다 (PRD §5.1)."""
+    out = {"parents": [], "derived": [], "related": []}
+    for r in conn.execute(
+        "SELECT r.*, f.ref AS from_ref, t.ref AS to_ref, f.title AS from_title, "
+        "t.title AS to_title FROM idea_relation r "
+        "JOIN idea f ON f.id = r.from_idea_id JOIN idea t ON t.id = r.to_idea_id "
+        "WHERE r.from_idea_id = ? OR r.to_idea_id = ?", (idea_id, idea_id)):
+        item = {"type": r["rel_type"], "rationale": r["rationale"],
+                "confidence": r["confidence"], "created_by": r["created_by"],
+                "confirmed_by_user": bool(r["confirmed_by_user"]),
+                "created_at": r["created_at"]}
+        if r["rel_type"] == "derived_from":
+            if r["from_idea_id"] == idea_id:
+                out["parents"].append({**item, "ref": r["to_ref"], "title": r["to_title"]})
+            else:
+                out["derived"].append({**item, "ref": r["from_ref"], "title": r["from_title"]})
+        else:
+            other = (r["to_ref"], r["to_title"]) if r["from_idea_id"] == idea_id \
+                else (r["from_ref"], r["from_title"])
+            out["related"].append({**item, "ref": other[0], "title": other[1]})
+    return out
+
+
+def _idea_dict(conn, idea, full=False):
+    d = {"ref": idea["ref"], "title": idea["title"],
+         "storage_state": idea["storage_state"], "dev_stage": idea["dev_stage"],
+         "created_at": idea["created_at"], "updated_at": idea["updated_at"],
+         "tags": idea_tags(conn, idea["id"]),
+         "record_dates": _record_dates(conn, idea["id"]),
+         "preview": _preview(conn, idea["id"])}
+    if not full:
+        return d
+    d["raw_entries"] = [
+        {"entry_id": r["id"], "captured_at": r["captured_at"], "type": r["entry_type"],
+         "body": r["body"], "redacted": bool(r["redacted_at"])}
+        for r in conn.execute(
+            "SELECT * FROM raw_entry WHERE idea_id=? ORDER BY captured_at, id", (idea["id"],))]
+    d["revisions"] = [
+        {"rev_no": r["rev_no"], "created_at": r["created_at"], "author": r["author"],
+         "change_summary": r["change_summary"], "body": r["body"],
+         "is_latest": r["id"] == idea["latest_revision_id"]}
+        for r in conn.execute(
+            "SELECT * FROM revision WHERE idea_id=? ORDER BY rev_no", (idea["id"],))]
+    d["latest_revision"] = next((r for r in d["revisions"] if r["is_latest"]), None)
+    d["relations"] = _relations(conn, idea["id"])
+    d["attachments"] = [
+        {"entry_id": r["raw_entry_id"], "filename": r["filename"],
+         "stored_path": r["stored_path"], "redacted": bool(r["redacted_at"])}
+        for r in conn.execute(
+            "SELECT a.* FROM attachment a JOIN raw_entry e ON e.id = a.raw_entry_id "
+            "WHERE e.idea_id = ?", (idea["id"],))]
+    return d
+
+
+# --------------------------------------------------------------------------
+# 표시 형식 (PRD §8.3, §8.4)
+# --------------------------------------------------------------------------
+
+def render_list(items):
+    out = []
+    for d in items:
+        dates = ", ".join(x[5:] for x in d["record_dates"]) or "-"
+        out.append(
+            f"{d['ref']} | {d['created_at'][:10]} → {d['updated_at'][:10]}\n"
+            f"키워드: {', '.join(d['tags']) or '-'}\n"
+            f"원문: {d['preview']}\n"
+            f"수정일: {dates}")
+    return "\n\n".join(out) or "(해당하는 글감이 없습니다)"
+
+
+def render_show(d):
+    rel = d["relations"]
+    lines = [
+        f"{d['ref']} — {d['title']}",
+        f"보관 상태: {d['storage_state']}   발전 단계: {d['dev_stage']}",
+        f"생성일: {d['created_at'][:10]}   최종 업데이트: {d['updated_at'][:10]}",
+        f"전체 기록일: {', '.join(x[5:] for x in d['record_dates']) or '-'}",
+        f"키워드: {', '.join(d['tags']) or '-'}",
+        "관련 글감: " + (", ".join(
+            f"{r['ref']} ({r['type']}{', 확인됨' if r['confirmed_by_user'] else ''})"
+            for r in rel["related"]) or "없음"),
+        "부모 글감: " + (", ".join(r["ref"] for r in rel["parents"]) or "없음"),
+        "파생 글감: " + (", ".join(r["ref"] for r in rel["derived"]) or "없음"),
+        "", "[날짜별 원문]  ← 교수님 원문, 무수정",
+    ]
+    for e in d["raw_entries"]:
+        lines.append(e["captured_at"][:16].replace("T", " "))
+        lines.append("(영구 삭제됨)" if e["redacted"] else e["body"])
+        lines.append("")
+    if d["latest_revision"]:
+        r = d["latest_revision"]
+        lines.append(f"[정제본 rev.{r['rev_no']}]  ← Clio 작성")
+        lines.append(r["body"])
+    else:
+        lines.append("[정제본] 아직 없습니다.")
+    return "\n".join(lines)
+
+
+# --------------------------------------------------------------------------
+# 명령
+# --------------------------------------------------------------------------
+
+def cmd_list(args, cfg):
+    conn = connect(create=False)
+    sql = "SELECT * FROM idea WHERE deleted_at IS NULL"
+    params = []
+    if args.state == "all":
+        pass
+    elif args.state:
+        sql += " AND storage_state = ?"
+        params.append(args.state)
+    if args.stage:
+        sql += " AND dev_stage = ?"
+        params.append(args.stage)
+    order = {"updated": "updated_at DESC", "created": "created_at DESC",
+             "ref": ref_order_sql()}[args.order]
+    sql += f" ORDER BY {order} LIMIT ?"
+    params.append(args.limit or cfg["default_list_limit"])
+    items = [_idea_dict(conn, r) for r in conn.execute(sql, params)]
+    if args.format == "text":
+        return {"text": render_list(items), "count": len(items)}
+    return {"count": len(items), "ideas": items}
+
+
+def cmd_show(args, cfg):
+    conn = connect(create=False)
+    idea = get_idea(conn, args.idea_ref, allow_deleted=args.include_deleted)
+    d = _idea_dict(conn, idea, full=True)
+    if args.format == "text":
+        return {"text": render_show(d), "ref": d["ref"]}
+    return d
+
+
+def cmd_query(args, cfg):
+    conn = connect(create=False)
+    include_archived = args.state in (None, "all", "archived")
+    cands = score_candidates(conn, cfg, args.q, limit=args.limit,
+                             include_archived=include_archived)
+    # 공통어 없이 최근성만으로 올라온 잡음은 결과에서 뺀다.
+    floor = cfg.get("mention_threshold", 0.0)
+    cands = [c for c in cands if c["score"] >= floor and c["common_terms"]]
+    refs = []
+    for c in cands:
+        idea = get_idea(conn, c["ref"])
+        if args.state and args.state != "all" and idea["storage_state"] != args.state:
+            continue
+        if args.since and idea["created_at"][:10] < args.since:
+            continue
+        if args.until and idea["created_at"][:10] > args.until:
+            continue
+        d = _idea_dict(conn, idea)
+        d["score"] = c["score"]
+        d["why"] = {"common_terms": c["common_terms"], "common_tags": c["common_tags"],
+                    "signals": c["signals"]}
+        refs.append(d)
+    if args.format == "text":
+        blocks = [f"{d['ref']} — 공통어: {', '.join(d['why']['common_terms']) or '-'}\n"
+                  f"제목: {d['title']}  (점수 {d['score']})" for d in refs]
+        return {"text": "\n\n".join(blocks) or "(찾은 글감이 없습니다)", "count": len(refs)}
+    return {"count": len(refs), "results": refs}
+
+
+def cmd_similar(args, cfg):
+    """유사 후보와 §6.3 확신도 분기 결과를 함께 낸다. 실행은 하지 않는다."""
+    conn = connect(create=False)
+    text = args.text
+    entry_id = args.entry_id
+    if entry_id and not text:
+        text = get_entry(conn, entry_id)["body"]
+    if not text:
+        raise ClioError("no_text", "--text 또는 --entry-id가 필요합니다.")
+    cands = score_candidates(conn, cfg, text, limit=args.limit)
+    d = decide(cfg, cands)
+    if not args.no_log:
+        with tx(conn):
+            log_action(conn, "candidates", f"raw_entry:{entry_id or 0}",
+                       {"undo": [], "entry_id": entry_id, "decision": d["action"],
+                        "candidates": [{"ref": c["ref"], "score": c["score"]}
+                                       for c in cands[:5]]}, now_iso(cfg))
+    return {"decision": d["action"], "reason": d["reason"],
+            "target": d.get("target"), "candidates": d["candidates"],
+            "thresholds": {"auto_link": cfg["auto_link_threshold"],
+                           "ask": cfg["ask_threshold"],
+                           "margin": cfg["auto_link_margin"]}}
+
+
+def cmd_unassigned(args, cfg):
+    conn = connect(create=False)
+    rows = conn.execute(
+        "SELECT * FROM raw_entry WHERE assign_state='unassigned' AND redacted_at IS NULL "
+        "ORDER BY captured_at DESC LIMIT ?", (args.limit,))
+    items = [{"entry_id": r["id"], "captured_at": r["captured_at"], "type": r["entry_type"],
+              "preview": " ".join(r["body"].split())[:90]} for r in rows]
+    return {"count": len(items), "entries": items}
+
+
+def cmd_trace(args, cfg):
+    conn = connect(create=False)
+    e = get_entry(conn, args.entry_id)
+    src = conn.execute("SELECT * FROM source WHERE id=?", (e["source_id"],)).fetchone()
+    idea_ref = None
+    if e["idea_id"]:
+        idea_ref = conn.execute("SELECT ref FROM idea WHERE id=?", (e["idea_id"],)).fetchone()["ref"]
+    return {"entry_id": e["id"], "idea_ref": idea_ref, "captured_at": e["captured_at"],
+            "ingested_at": e["ingested_at"], "body_hash": e["body_hash"],
+            "redacted": bool(e["redacted_at"]),
+            "source": dict(src) if src else None}
+
+
+def cmd_relations(args, cfg):
+    conn = connect(create=False)
+    idea = get_idea(conn, args.idea_ref)
+    return {"ref": idea["ref"], "relations": _relations(conn, idea["id"])}
+
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="idea_search", description="Clio 아이디어 조회 계층")
+    sub = p.add_subparsers(dest="cmd")
+
+    l = sub.add_parser("list", help="글감 목록 (기본: active, 최근 업데이트순)")
+    l.add_argument("--state", default="active",
+                   choices=STORAGE_STATES + ["all"])
+    l.add_argument("--stage", choices=DEV_STAGES)
+    l.add_argument("--limit", type=int)
+    l.add_argument("--order", choices=["updated", "created", "ref"], default="updated")
+    l.add_argument("--format", choices=["json", "text"], default="json")
+    l.set_defaults(fn=cmd_list)
+
+    s = sub.add_parser("show", help="특정 글감 상세")
+    s.add_argument("--idea-ref", required=True)
+    s.add_argument("--include-deleted", action="store_true")
+    s.add_argument("--format", choices=["json", "text"], default="json")
+    s.set_defaults(fn=cmd_show)
+
+    q = sub.add_parser("query", help="검색 (판단 근거 포함)")
+    q.add_argument("--q", required=True)
+    q.add_argument("--state", choices=STORAGE_STATES + ["all"])
+    q.add_argument("--since")
+    q.add_argument("--until")
+    q.add_argument("--limit", type=int, default=10)
+    q.add_argument("--format", choices=["json", "text"], default="json")
+    q.set_defaults(fn=cmd_query)
+
+    m = sub.add_parser("similar", help="유사 후보 + §6.3 확신도 분기")
+    m.add_argument("--text")
+    m.add_argument("--entry-id", type=int)
+    m.add_argument("--limit", type=int, default=10)
+    m.add_argument("--no-log", action="store_true")
+    m.set_defaults(fn=cmd_similar)
+
+    u = sub.add_parser("unassigned", help="미분류 원문 목록")
+    u.add_argument("--limit", type=int, default=50)
+    u.set_defaults(fn=cmd_unassigned)
+
+    t = sub.add_parser("trace", help="출처 메시지 역추적")
+    t.add_argument("--entry-id", type=int, required=True)
+    t.set_defaults(fn=cmd_trace)
+
+    r = sub.add_parser("relations", help="관계와 그 근거 조회")
+    r.add_argument("--idea-ref", required=True)
+    r.set_defaults(fn=cmd_relations)
+    return p
+
+
+if __name__ == "__main__":
+    run_cli(build_parser, lambda args, cfg: args.fn(args, cfg))

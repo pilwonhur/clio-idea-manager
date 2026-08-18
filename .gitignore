@@ -1,0 +1,9 @@
+__pycache__/
+*.py[cod]
+.DS_Store
+
+# 데이터는 저장소에 들어가지 않는다 (~/ClioData). 실험용 디렉터리도 마찬가지.
+ClioData/
+*.db
+*.db-wal
+*.db-shm
