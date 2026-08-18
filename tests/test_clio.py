@@ -192,7 +192,6 @@ class ClioTest(unittest.TestCase):
         skill = Path(tempfile.mkdtemp(prefix="clio-skill-"))
         data = Path(tempfile.mkdtemp(prefix="clio-instdata-"))
         self.addCleanup(shutil.rmtree, skill, ignore_errors=True)
-        self.addCleanup(shutil.rmtree, str(skill) + ".prev", ignore_errors=True)
         self.addCleanup(shutil.rmtree, data, ignore_errors=True)
 
         env = dict(os.environ, CLIO_SKILL_DIR=str(skill), CLIO_DATA_DIR=str(data))
@@ -236,14 +235,17 @@ class ClioTest(unittest.TestCase):
 
         # 낡은 파일은 사라지고, 되돌릴 수 있게 직전 스킬이 남는다
         self.assertFalse(stale.exists())
-        self.assertTrue(Path(str(skill) + ".prev", "scripts", "idea_store").exists())
+        self.assertTrue((data / "skill-prev" / "scripts" / "idea_store").exists())
+
+        # 롤백본은 스킬 디렉터리 밖에 있어야 한다. 안에 있으면 중복 스킬로 등록된다
+        self.assertFalse(Path(str(skill) + ".prev").exists())
+        self.assertFalse(any(p.name == "SKILL.md" for p in skill.parent.glob("*.prev/*")))
 
     def test_update_from_pre_versioned_install_is_detected(self):
         """CLIO_VERSION이 없던 구버전 설치도 업데이트로 인식하고 롤백본을 남긴다."""
         skill = Path(tempfile.mkdtemp(prefix="clio-legacy-"))
         data = Path(tempfile.mkdtemp(prefix="clio-legacydata-"))
         self.addCleanup(shutil.rmtree, skill, ignore_errors=True)
-        self.addCleanup(shutil.rmtree, str(skill) + ".prev", ignore_errors=True)
         self.addCleanup(shutil.rmtree, data, ignore_errors=True)
         env = dict(os.environ, CLIO_SKILL_DIR=str(skill), CLIO_DATA_DIR=str(data))
 
@@ -264,7 +266,7 @@ class ClioTest(unittest.TestCase):
         out = install()
         self.assertIn("업데이트", out)
         self.assertIn("버전 미상", out)
-        self.assertTrue(Path(str(skill) + ".prev", "scripts", "clio_core.py").exists())
+        self.assertTrue((data / "skill-prev" / "scripts" / "clio_core.py").exists())
 
     def test_version_is_reported_and_matches_changelog(self):
         """버전은 CLIO_VERSION이 단일 원본이고, CHANGELOG 맨 위 항목과 일치해야 한다."""

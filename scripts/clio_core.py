@@ -33,7 +33,7 @@ from zoneinfo import ZoneInfo
 #   PATCH — 버그 수정, 문서 수정
 #
 # 데이터 파일 형식의 버전은 SCHEMA_VERSION으로 따로 관리한다.
-CLIO_VERSION = "1.2.1"
+CLIO_VERSION = "1.2.2"
 
 # --------------------------------------------------------------------------
 # 설정 (PRD §11)

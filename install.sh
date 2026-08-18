@@ -12,7 +12,9 @@ set -euo pipefail
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="${CLIO_SKILL_DIR:-$HOME/.claude/skills/clio-idea-manager}"
 DATA_DIR="${CLIO_DATA_DIR:-$HOME/ClioData}"
-PREV_DIR="$SKILL_DIR.prev"
+# 롤백본은 스킬 디렉터리 **밖**에 둔다. ~/.claude/skills/ 안에 두면 SKILL.md가 딸려 있어
+# 같은 설명을 가진 스킬이 하나 더 등록되고, 어느 쪽이 불릴지 알 수 없게 된다.
+PREV_DIR="${CLIO_PREV_DIR:-$DATA_DIR/skill-prev}"
 
 # 스킬 디렉터리에 두는 것 (데이터는 여기 들어오지 않는다)
 PAYLOAD=(SKILL.md CHANGELOG.md scripts references evals tests)
@@ -46,11 +48,23 @@ else
   echo "== Clio 스킬 설치: $NEW_VER =="
 fi
 echo "스킬  : $SKILL_DIR"
-echo "데이터: $DATA_DIR  (건드리지 않음)"
+echo "데이터: $DATA_DIR  (ideas.db·첨부·백업은 건드리지 않음)"
 echo
+
+# 0) v1.2.2 이전이 스킬 디렉터리 옆에 남긴 롤백본을 걷어낸다.
+#    그 자리에 있으면 중복 스킬로 등록되므로 위치만 옮겨 보관한다.
+LEGACY_PREV="$SKILL_DIR.prev"
+if [ -d "$LEGACY_PREV" ]; then
+  mkdir -p "$(dirname "$PREV_DIR")"
+  rm -rf "$PREV_DIR"
+  mv "$LEGACY_PREV" "$PREV_DIR"
+  echo "이전 위치의 롤백본을 옮겼습니다: $LEGACY_PREV → $PREV_DIR"
+  echo "  (스킬 디렉터리 안에 있으면 중복 스킬로 등록됩니다)"
+fi
 
 # 1) 되돌릴 수 있게 직전 스킬을 한 세대만 보관한다 (코드만, 데이터 아님)
 if [ "$MODE" = "업데이트" ]; then
+  mkdir -p "$(dirname "$PREV_DIR")"
   rm -rf "$PREV_DIR"
   cp -R "$SKILL_DIR" "$PREV_DIR"
   echo "이전 버전 보관: $PREV_DIR  (되돌리려면 이 디렉터리를 다시 복사하면 된다)"

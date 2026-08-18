@@ -14,6 +14,17 @@
 
 데이터 파일 형식의 버전(`SCHEMA_VERSION`)은 별도로 관리한다. 현재 `1`.
 
+## [1.2.2] — 2026-08-19
+
+### 수정
+
+- **롤백본이 스킬로 중복 등록되던 문제.** v1.2.0~1.2.1은 직전 스킬을
+  `~/.claude/skills/clio-idea-manager.prev`에 보관했는데, 그 안에 `SKILL.md`가 있어
+  같은 설명을 가진 스킬이 하나 더 등록됐다. 어느 쪽이 호출될지 알 수 없어 위험하다.
+  보관 위치를 `~/ClioData/skill-prev/`(환경 변수 `CLIO_PREV_DIR`로 변경 가능)로 옮겼다.
+- 이전 위치(`<스킬 경로>.prev`)에 남아 있는 롤백본은 업데이트 시 자동으로 새 위치로 옮긴다.
+- README의 `git clone` 주소에 남아 있던 자리표시자(`<your-account>`)를 실제 주소로 교체.
+
 ## [1.2.1] — 2026-08-19
 
 ### 수정
@@ -87,6 +98,7 @@
 - 온라인 스냅샷 백업(일 7/주 4/월 12), redaction manifest, 복구 시험.
 - 저장 계층 테스트 26건.
 
+[1.2.2]: https://github.com/pilwonhur/clio-idea-manager/releases/tag/v1.2.2
 [1.2.1]: https://github.com/pilwonhur/clio-idea-manager/releases/tag/v1.2.1
 [1.2.0]: https://github.com/pilwonhur/clio-idea-manager/releases/tag/v1.2.0
 [1.1.0]: https://github.com/pilwonhur/clio-idea-manager/releases/tag/v1.1.0

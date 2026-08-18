@@ -6,7 +6,7 @@ Discord·Telegram·WhatsApp 같은 메신저로 던진 한 문장이 대화 로�
 지시어 하나로 원문을 그대로 데이터베이스에 커밋하고, 그 뒤에 분류·정제·연결을 이어붙인다.
 판단은 LLM이 하고 저장은 결정론적 CLI 도구가 한다. 외부 의존성은 없다.
 
-[![version](https://img.shields.io/badge/version-1.2.1-informational)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.2.2-informational)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![dependencies](https://img.shields.io/badge/dependencies-none-success)](#요구사항)
 [![storage](https://img.shields.io/badge/storage-SQLite%20%2B%20FTS5-003B57?logo=sqlite&logoColor=white)](#8-데이터-모델)
@@ -188,7 +188,7 @@ scripts/idea_store new-idea --entry-id 21 --title "선택적 망각" --tags "기
 ### 설치 스크립트
 
 ```bash
-git clone https://github.com/<your-account>/clio-idea-manager.git
+git clone https://github.com/pilwonhur/clio-idea-manager.git
 cd clio-idea-manager
 ./install.sh
 ```
@@ -200,16 +200,16 @@ cd clio-idea-manager
 3. 스키마를 생성(`idea_check init`, 멱등)하고 무결성 검사를 돌려 결과를 출력한다.
 
 ```
-== Clio 스킬 설치: 1.2.0 ==
+== Clio 스킬 설치: 1.2.2 ==
 스킬  : /Users/you/.claude/skills/clio-idea-manager
-데이터: /Users/you/ClioData  (건드리지 않음)
+데이터: /Users/you/ClioData  (ideas.db·첨부·백업은 건드리지 않음)
 
 파일: 추가 12 · 갱신 0 · 유지 0 · 삭제 0
 config.json 생성 (자동 연결은 초기 비활성 — PRD D1)
 데이터베이스를 새로 만들었습니다. (스키마 v1)
 무결성: 이상 없음
 
-설치 완료 — clio-idea-manager 1.2.0
+설치 완료 — clio-idea-manager 1.2.2
 데이터베이스: /Users/you/ClioData/ideas.db
 ```
 
@@ -237,17 +237,17 @@ cd ~/Downloads/clio-idea-manager-new
 실행하면 무엇이 바뀌었는지 건수로 보고한다.
 
 ```
-== Clio 스킬 업데이트: 1.1.0 → 1.2.0 ==
+== Clio 스킬 업데이트: 1.2.1 → 1.2.2 ==
 스킬  : /Users/you/.claude/skills/clio-idea-manager
-데이터: /Users/you/ClioData  (건드리지 않음)
+데이터: /Users/you/ClioData  (ideas.db·첨부·백업은 건드리지 않음)
 
-이전 버전 보관: /Users/you/.claude/skills/clio-idea-manager.prev
+이전 버전 보관: /Users/you/ClioData/skill-prev
 파일: 추가 0 · 갱신 3 · 유지 9 · 삭제 0
 config.json 유지 (변경 없음)
 기존 데이터베이스를 그대로 사용합니다. (스키마 v1)
 무결성: 이상 없음
 
-업데이트 완료 — clio-idea-manager 1.2.0
+업데이트 완료 — clio-idea-manager 1.2.2
 변경 내용: /Users/you/.claude/skills/clio-idea-manager/CHANGELOG.md
 ```
 
@@ -260,7 +260,7 @@ config.json 유지 (변경 없음)
 | 새 버전에서 추가된 설정 키 | 기본값으로 **채워 넣는다** — 없던 키만 |
 | 바뀐 스킬 파일 | 덮어쓴다 |
 | 이전 버전에만 있던 파일 | 지운다 (낡은 스크립트가 남아 오작동하지 않도록) |
-| 직전 스킬 코드 | `<스킬 경로>.prev`에 한 세대 보관한다 |
+| 직전 스킬 코드 | `~/ClioData/skill-prev/`에 한 세대 보관한다 (스킬 디렉터리 밖) |
 | 스키마 | `idea_check init`이 멱등하게 보장하고, 끝나면 무결성을 검사한다 |
 
 설치된 버전은 언제든 확인할 수 있다.
@@ -276,10 +276,14 @@ config.json 유지 (변경 없음)
 새 버전이 이상하면 직전 스킬 코드로 되돌린다. **데이터는 관여하지 않으므로 그대로 남는다.**
 
 ```bash
-cd ~/.claude/skills
-rm -rf clio-idea-manager && mv clio-idea-manager.prev clio-idea-manager
-scripts/idea_check --version    # 되돌아간 버전 확인
+rm -rf ~/.claude/skills/clio-idea-manager
+cp -R ~/ClioData/skill-prev ~/.claude/skills/clio-idea-manager
+~/.claude/skills/clio-idea-manager/scripts/idea_check --version    # 되돌아간 버전 확인
 ```
+
+> 롤백본은 **`~/.claude/skills/` 밖에** 둔다. 스킬 디렉터리 안에 사본을 두면 `SKILL.md`가
+> 딸려 있어 같은 설명의 스킬이 하나 더 등록되고, 어느 쪽이 호출될지 알 수 없게 된다.
+> 보관 위치는 `CLIO_PREV_DIR`로 바꿀 수 있다.
 
 특정 버전으로 다시 설치하고 싶다면 저장소에서 그 태그를 꺼내 `install.sh`를 실행한다.
 
@@ -1169,7 +1173,8 @@ v1의 범위 밖이다. DB 원본을 동기화 폴더에 두면 손상 위험이
 | `SyntaxError` / `ModuleNotFoundError: zoneinfo` | Python 3.11 미만 | `python3 --version` 확인 후 3.11 이상으로 실행 |
 | 백업 미러가 비어 있다 | `backup_mirror` 경로가 없거나 `--no-mirror`를 줬다 | `config.json`의 경로를 만들고 다시 실행. 응답의 `mirrored_to`로 확인 |
 | 복구 후 지운 내용이 되살아났다 | 매니페스트 미적용 | `backups/redaction_manifest.json`을 복구 직후 다시 적용한다 |
-| 업데이트 후 동작이 이상하다 | 새 버전의 문제 | `~/.claude/skills/clio-idea-manager.prev`로 되돌린다 ([§4](#업데이트를-되돌리기)). 데이터는 영향받지 않는다 |
+| 업데이트 후 동작이 이상하다 | 새 버전의 문제 | `~/ClioData/skill-prev`로 되돌린다 ([§4](#업데이트를-되돌리기)). 데이터는 영향받지 않는다 |
+| 같은 스킬이 두 개로 보인다 | v1.2.2 이전이 `~/.claude/skills/` 안에 롤백본을 남겼다 | `./install.sh`를 다시 실행하면 `~/ClioData/skill-prev`로 옮긴다 |
 | `update.sh`가 로컬 변경으로 멈춘다 | 저장소에 커밋하지 않은 수정이 있다 | `git status`로 확인 후 정리(`git stash` 또는 커밋)하고 다시 실행한다 |
 | 업데이트했는데 옛 동작이 그대로다 | 낡은 `__pycache__` | 설치 스크립트가 정리하지만, 수동 실행 중이라면 `find . -name __pycache__ -exec rm -rf {} +` |
 
@@ -1182,7 +1187,7 @@ v1의 범위 밖이다. DB 원본을 동기화 폴더에 두면 손상 위험이
 형식으로 남긴다.
 
 ```bash
-scripts/idea_store --version        # clio-idea-manager 1.2.1
+scripts/idea_store --version        # clio-idea-manager 1.2.2
 scripts/idea_check integrity        # 응답 JSON에 "clio_version" 포함
 ```
 
