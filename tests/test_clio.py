@@ -26,15 +26,26 @@ import clio_core  # noqa: E402
 
 class ClioTest(unittest.TestCase):
     def setUp(self):
+        # 홈 폴더도 격리한다. 위치 기록·새 기본 위치·백업 루트가 모두 홈 기준이다.
+        self.home = Path(tempfile.mkdtemp(prefix="clio-home-"))
         self.data = Path(tempfile.mkdtemp(prefix="clio-test-"))
         self.mirror = Path(tempfile.mkdtemp(prefix="clio-mirror-"))
         (self.data / "config.json").write_text(
             json.dumps({"backup_mirror": str(self.mirror)}), encoding="utf-8")
-        self.env = dict(os.environ, CLIO_DATA_DIR=str(self.data))
+        self.env = dict(os.environ, CLIO_DATA_DIR=str(self.data), HOME=str(self.home))
+        self._saved_env = {k: os.environ.get(k) for k in ("HOME", "CLIO_DATA_DIR")}
+        os.environ["HOME"] = str(self.home)
 
     def tearDown(self):
-        shutil.rmtree(self.data, ignore_errors=True)
-        shutil.rmtree(self.mirror, ignore_errors=True)
+        for k, v in self._saved_env.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        clio_core.invalidate_resolution()
+        for d in (self.data, self.mirror, self.home):
+            subprocess.run(["chmod", "-R", "u+w", str(d)], capture_output=True)
+            shutil.rmtree(d, ignore_errors=True)
 
     # -- 헬퍼 ------------------------------------------------------------
     def sh(self, script, *args, expect_ok=True, env=None):
@@ -480,6 +491,11 @@ class ClioTest(unittest.TestCase):
         self.sh("idea_export", "md", "--out", str(out))
         idx = (out / "index.md").read_text(encoding="utf-8")
         self.assertLess(idx.index("CLIO-9999"), idx.index("CLIO-10000"))
+
+
+# 데이터 위치·이전·복구 테스트도 함께 돈다 (python3 tests/test_clio.py 하나로 전체 실행)
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from test_relocation import RelocationTest  # noqa: E402,F401
 
 
 if __name__ == "__main__":

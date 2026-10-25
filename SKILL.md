@@ -1,6 +1,6 @@
 ---
 name: clio-idea-manager
-description: 교수님의 글감(아이디어) 포착·검색·정제·연결을 관리한다. 메시지가 `글감:`, `아이디어:`, `ㄱ:` 로 시작하거나 "방금 거 저장해" 같은 소급 저장 요청일 때 반드시 사용한다. 또한 "글감 목록", "CLIO-0012 보여줘", "기억 관련 글감 찾아줘", "미분류 원문", "0003이랑 0007 합쳐줘", "방금 연결 취소해", 백업·무결성 점검 요청에도 사용한다. 지시어 없는 일반 대화에는 사용하지 않는다.
+description: 교수님의 글감(아이디어) 포착·검색·정제·연결을 관리한다. 메시지가 `글감:`, `아이디어:`, `ㄱ:` 로 시작하거나 "방금 거 저장해" 같은 소급 저장 요청일 때 반드시 사용한다. 또한 "글감 목록", "CLIO-0012 보여줘", "기억 관련 글감 찾아줘", "미분류 원문", "0003이랑 0007 합쳐줘", "방금 연결 취소해", 백업·무결성 점검·데이터 위치 확인과 이전 요청에도 사용한다. 지시어 없는 일반 대화에는 사용하지 않는다.
 ---
 
 # Clio 아이디어 관리
@@ -197,12 +197,23 @@ scripts/idea_store undo                                    # 직전 작업 취�
 ## 7. 운영
 
 ```bash
+scripts/idea_check where              # 지금 쓰는 데이터 폴더와 그 판정 근거 (쓰기 없음)
 scripts/idea_check integrity          # 무결성 검사
-scripts/idea_check backup             # 스냅샷 + 내보내기 + Dropbox 미러
+scripts/idea_check backup             # 스냅샷 + 내보내기 → backup_root (미러는 폴더가 있을 때만)
 scripts/idea_check restore-test --source <백업 경로>
 scripts/idea_export md                # Obsidian 열람용
 scripts/idea_check calibrate          # 자동 연결 임계값 조정 근거 (§8)
+scripts/idea_relocate plan            # 데이터 폴더 이전 미리보기 (쓰기 없음)
+scripts/idea_relocate status          # 이전 기록·현재 위치·끝나지 않은 작업
 ```
+
+데이터 폴더는 도구가 정한다 (`references/relocation.md` §1). 경로를 짐작해 적거나
+`CLIO_DATA_DIR`을 임의로 붙이지 않는다. 도구가 `root_ambiguous`·`root_missing`·`root_retired`·
+`root_busy` 등으로 실패하면 저장되지 않은 것이다 — §3 "저장 실패" 형식으로 그대로 알린다.
+
+**`idea_relocate run`·`idea_relocate rollback`은 스스로 실행하지 않는다.** 교수님이 이전이나
+되돌리기를 요청하면 먼저 `plan`(또는 `rollback --dry-run`)의 `summary_lines`를 보여드리고,
+명시적으로 승인한 뒤에만 실행한다. 실행 결과(새 위치, 보존한 옛 DB, 백업 경로)를 그대로 보고한다.
 
 ## 8. 임계값을 함부로 바꾸지 않는다
 
@@ -210,7 +221,7 @@ scripts/idea_check calibrate          # 자동 연결 임계값 조정 근거 (�
 잘못된 자동 연결은 조용히 누적되지만 확인 질문의 비용은 즉시 드러나고 되돌리기도 쉽다.
 
 글감 50건 또는 4주가 지난 뒤 `idea_check calibrate`를 돌려 1위 후보 채택률이 95% 이상인
-구간이 확인되면, 그 결과를 교수님께 보여드리고 `~/ClioData/config.json`을 수정한다.
+구간이 확인되면, 그 결과를 교수님께 보여드리고 데이터 폴더의 `config.json`(`idea_check where`)을 수정한다.
 **근거 없이 낮추지 않는다.**
 
 ## 참조
@@ -218,4 +229,5 @@ scripts/idea_check calibrate          # 자동 연결 임계값 조정 근거 (�
 - `references/schema.md` — 데이터 모델과 단일 원본 규칙
 - `references/conversation-rules.md` — 응답 문안 모음
 - `references/recovery-policy.md` — 삭제·백업·복구 정책
-- `tests/test_clio.py` — PRD §13 성공 기준 20건
+- `references/relocation.md` — 데이터 위치 판정·이전·되돌리기
+- `tests/test_clio.py` — PRD §13 성공 기준, `tests/test_relocation.py` — 위치·이전·복구

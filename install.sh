@@ -5,13 +5,45 @@
 #   ./install.sh
 #
 # 업데이트는 지우고 다시 까는 방식이 아니다. 바뀐 파일만 덮어쓰고, 원본에서
-# 사라진 파일만 지운다. 데이터(~/ClioData)와 사용자가 고친 config.json 값은
-# 어떤 경우에도 보존한다. 되돌릴 수 있도록 직전 스킬을 한 세대 보관한다.
+# 사라진 파일만 지운다. 데이터와 사용자가 고친 config.json 값은 어떤 경우에도
+# 보존한다. 되돌릴 수 있도록 직전 스킬을 한 세대 보관한다.
+#
+# 데이터 위치 (v1.3.0~) — 설치·업데이트는 데이터를 옮기지 않는다.
+#   CLIO_DATA_DIR 환경 변수 > 위치 기록(~/.config/clio-idea-manager/data-root.json)
+#   > 기존 설치(~/ClioData) > 새 기본값(~/SecretaryData/services/ideas)
+# 기존 설치는 그 자리를 계속 쓰고, 위치 기록에 고정해 둔다. 새 위치로 옮기려면
+# scripts/idea_relocate plan → run 을 따로 실행한다.
 set -euo pipefail
 
 SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SKILL_DIR="${CLIO_SKILL_DIR:-$HOME/.claude/skills/clio-idea-manager}"
-DATA_DIR="${CLIO_DATA_DIR:-$HOME/ClioData}"
+
+json_get() {  # $1 = 점으로 이은 키. 표준입력의 JSON에서 값을 꺼낸다 (없으면 빈 문자열)
+  python3 -c '
+import json, sys
+v = json.load(sys.stdin)
+for k in sys.argv[1].split("."):
+    v = v.get(k) if isinstance(v, dict) else None
+print("" if v is None else v)' "$1"
+}
+
+# 0) 데이터 위치 판정 — 새 코드로 판정하되 아무것도 쓰지 않는다.
+#    판정할 수 없으면(두 위치에 모두 DB, 위치 기록이 가리키는 폴더 없음 등) 설치 전에 멈춘다.
+WHERE_JSON="$(python3 "$SRC/scripts/idea_check" where)" || {
+  echo "데이터 위치를 판정하지 못했습니다. 아무것도 바꾸지 않았습니다:" >&2
+  echo "$WHERE_JSON" >&2
+  exit 1
+}
+DATA_DIR="$(printf '%s' "$WHERE_JSON" | json_get data_dir)"
+DATA_SOURCE="$(printf '%s' "$WHERE_JSON" | json_get source)"
+DATA_LABEL="$(printf '%s' "$WHERE_JSON" | json_get source_label)"
+if [ "$(printf '%s' "$WHERE_JSON" | json_get usable)" != "True" ]; then
+  echo "데이터 위치에 문제가 있어 설치를 멈춥니다. 아무것도 바꾸지 않았습니다." >&2
+  echo "  위치: $DATA_DIR ($DATA_LABEL)" >&2
+  echo "  사유: $(printf '%s' "$WHERE_JSON" | json_get problem.message)" >&2
+  exit 1
+fi
+
 # 롤백본은 스킬 디렉터리 **밖**에 둔다. ~/.claude/skills/ 안에 두면 SKILL.md가 딸려 있어
 # 같은 설명을 가진 스킬이 하나 더 등록되고, 어느 쪽이 불릴지 알 수 없게 된다.
 PREV_DIR="${CLIO_PREV_DIR:-$DATA_DIR/skill-prev}"
@@ -48,7 +80,11 @@ else
   echo "== Clio 스킬 설치: $NEW_VER =="
 fi
 echo "스킬  : $SKILL_DIR"
-echo "데이터: $DATA_DIR  (ideas.db·첨부·백업은 건드리지 않음)"
+echo "데이터: $DATA_DIR  ($DATA_LABEL · ideas.db·첨부·백업은 옮기거나 지우지 않음)"
+printf '%s' "$WHERE_JSON" | python3 -c '
+import json, sys
+for w in json.load(sys.stdin).get("warnings", []):
+    print("  주의:", w["message"])'
 echo
 
 # 0) v1.2.2 이전이 스킬 디렉터리 옆에 남긴 롤백본을 걷어낸다.
@@ -126,12 +162,26 @@ print(f"파일: 추가 {added} · 갱신 {updated} · 유지 {kept} · 삭제 {r
 PY
 
 chmod +x "$SKILL_DIR/scripts/idea_store" "$SKILL_DIR/scripts/idea_search" \
-         "$SKILL_DIR/scripts/idea_export" "$SKILL_DIR/scripts/idea_check"
+         "$SKILL_DIR/scripts/idea_export" "$SKILL_DIR/scripts/idea_check" \
+         "$SKILL_DIR/scripts/idea_relocate"
 
-# 3) 데이터 디렉터리 — 없으면 만들고, config.json은 병합한다.
-#    사용자가 고친 값은 그대로 두고 새로 생긴 설정 키만 기본값으로 채운다.
-mkdir -p "$DATA_DIR"/{attachments,exports,backups}
-CLIO_DATA_DIR="$DATA_DIR" python3 - "$SKILL_DIR" "$DATA_DIR" <<'PY'
+# 3) 데이터 디렉터리 — 스키마를 멱등하게 보장하고(새 위치면 새로 만든다), 판정된 위치를
+#    위치 기록에 고정한다. 환경 변수로 지정한 경우에는 기록을 쓰지 않는다.
+#    --expect-root: 판정 이후 위치가 바뀌었으면 아무것도 만들지 않고 실패한다.
+INIT_JSON="$(python3 "$SKILL_DIR/scripts/idea_check" init --pin --expect-root "$DATA_DIR")" || {
+  echo "데이터베이스 준비에 실패했습니다:" >&2
+  echo "$INIT_JSON" >&2
+  exit 1
+}
+printf '%s' "$INIT_JSON" | python3 -c '
+import json, sys
+d = json.load(sys.stdin)
+print(d["message"], "(스키마 v%s)" % d["schema_version"])
+if d.get("pinned"):
+    print("위치 기록 고정:", d["pinned"]["path"], "(%s)" % d["pinned"]["reason"])'
+
+#    config.json은 병합한다. 사용자가 고친 값은 그대로 두고 새로 생긴 설정 키만 기본값으로 채운다.
+python3 - "$SKILL_DIR" "$DATA_DIR" <<'PY'
 import json, sys
 from pathlib import Path
 
@@ -165,15 +215,17 @@ else:
     print("config.json 유지 (변경 없음)")
 PY
 
-# 4) 스키마는 멱등하게 보장하고, 끝나면 무결성을 확인한다
-CLIO_DATA_DIR="$DATA_DIR" python3 "$SKILL_DIR/scripts/idea_check" init \
-  | python3 -c "import json,sys; d=json.load(sys.stdin); print(d['message'], '(스키마 v%s)' % d['schema_version'])"
-CLIO_DATA_DIR="$DATA_DIR" python3 "$SKILL_DIR/scripts/idea_check" integrity \
+# 4) 끝나면 무결성을 확인한다
+python3 "$SKILL_DIR/scripts/idea_check" integrity \
   | python3 -c "import json,sys; d=json.load(sys.stdin); print('무결성:', '이상 없음' if d['healthy'] else d['problems'])"
 
 echo
 echo "$MODE 완료 — clio-idea-manager $NEW_VER"
 echo "데이터베이스: $DATA_DIR/ideas.db"
+if [ "$DATA_SOURCE" = "legacy" ]; then
+  echo "기존 위치를 그대로 씁니다. 새 공통 위치로 옮기려면 (자동으로 옮기지 않음):"
+  echo "  $SKILL_DIR/scripts/idea_relocate plan    # 미리보기, 아무것도 바꾸지 않음"
+fi
 if [ "$MODE" = "업데이트" ] && [ "$OLD_VER" != "$NEW_VER" ]; then
   echo "변경 내용: $SKILL_DIR/CHANGELOG.md"
 fi

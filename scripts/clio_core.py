@@ -9,6 +9,7 @@ Python 3.11+ 표준 라이브러리만 사용한다 (PRD D3).
 from __future__ import annotations
 
 import argparse
+import fcntl
 import hashlib
 import json
 import os
@@ -16,8 +17,10 @@ import re
 import shutil
 import sqlite3
 import sys
+import time
 import unicodedata
-from datetime import datetime, timedelta
+import uuid
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from zoneinfo import ZoneInfo
 
@@ -33,13 +36,16 @@ from zoneinfo import ZoneInfo
 #   PATCH — 버그 수정, 문서 수정
 #
 # 데이터 파일 형식의 버전은 SCHEMA_VERSION으로 따로 관리한다.
-CLIO_VERSION = "1.2.2"
+CLIO_VERSION = "1.3.0"
 
 # --------------------------------------------------------------------------
 # 설정 (PRD §11)
 # --------------------------------------------------------------------------
 
 DEFAULT_CONFIG = {
+    # 로컬 백업 위치. 백업은 <backup_root>/<시각>/ 에 쌓인다.
+    "backup_root": "~/SecretaryBackups/ideas",
+    # 외부 미러. 이 폴더가 **이미 있을 때만** 복사한다 (자동으로 만들지 않는다).
     "backup_mirror": "~/Dropbox/ClioBackup",
     "timezone": "Asia/Seoul",
     "ref_prefix": "CLIO",
@@ -72,13 +78,364 @@ STORAGE_STATES = ["inbox", "active", "archived"]
 DEV_STAGES = ["fragment", "developed", "outlined", "drafted", "published"]
 
 
+class ClioError(Exception):
+    """도구 계층의 모든 실패. 종료 코드 1과 함께 JSON으로 보고된다."""
+
+    def __init__(self, code: str, message: str, **extra):
+        super().__init__(message)
+        self.code = code
+        self.message = message
+        self.extra = extra
+
+
+# --------------------------------------------------------------------------
+# 데이터 위치 (v1.3.0)
+# --------------------------------------------------------------------------
+#
+# 어느 폴더가 정본인지는 아래 순서로 정한다. 경로는 전부 실행 사용자의 홈에서
+# 계산하며 특정 사용자 경로를 코드에 박아 두지 않는다.
+#
+#   1. CLIO_DATA_DIR 환경 변수        — 사용자가 명시한 경로. 항상 우선한다.
+#   2. 위치 기록(pointer) 파일        — ~/.config/clio-idea-manager/data-root.json
+#                                       설치·이전이 남기는 정본 기록.
+#   3. 기존 설치(~/ClioData/ideas.db) — v1.2 이하가 쓰던 위치. 그대로 계속 쓴다.
+#   4. 새 기본값                      — ~/SecretaryData/services/ideas (신규 설치)
+#
+# 기본값이 바뀌었다고 기존 DB를 버리고 빈 DB를 새로 만드는 일은 없다. 기존 위치에서
+# 새 위치로 옮기는 것은 idea_relocate의 명시적 절차로만 한다.
+#
+# 각 데이터 폴더에는 위치 표시 파일(clio-root.json)이 있다. 이전이 끝난 옛 폴더는
+# state="retired"로 표시되고, ideas.db 자리에 SQLite가 아닌 차단 파일이 놓인다.
+# 차단 파일 덕분에 위치 기록을 모르는 구버전 도구도 옛 DB를 열거나 그 자리에 빈 DB를
+# 새로 만들지 못하고 실패한다 (코드 다운그레이드가 옛 데이터를 여는 사고 방지).
+
+ROOT_MARKER = "clio-root.json"
+LOCK_NAME = ".clio.lock"
+DB_NAME = "ideas.db"
+SQLITE_MAGIC = b"SQLite format 3\x00"
+TOMBSTONE_MAGIC = b"CLIO-IDEA-MANAGER DATA MOVED"
+SOURCE_LABELS = {
+    "env": "CLIO_DATA_DIR 환경 변수",
+    "pointer": "위치 기록 파일",
+    "legacy": "기존 설치 위치 유지",
+    "default": "새 기본 위치",
+}
+
+
+def home() -> Path:
+    return Path("~").expanduser()
+
+
+def legacy_root() -> Path:
+    """v1.2 이하의 기본 위치."""
+    return home() / "ClioData"
+
+
+def secretary_root() -> Path:
+    return home() / "SecretaryData"
+
+
+def default_root() -> Path:
+    """v1.3부터 신규 설치의 기본 위치."""
+    return secretary_root() / "services" / "ideas"
+
+
+def pointer_path() -> Path:
+    return home() / ".config" / "clio-idea-manager" / "data-root.json"
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def _fsync_dir(path: Path) -> None:
+    try:
+        fd = os.open(path, os.O_RDONLY)
+    except OSError:
+        return
+    try:
+        os.fsync(fd)
+    except OSError:
+        pass
+    finally:
+        os.close(fd)
+
+
+def write_json_atomic(path: Path, obj, mode: int = 0o600) -> None:
+    """임시 파일에 쓰고 rename으로 교체한다. 중간에 끊겨도 반쯤 쓴 파일이 남지 않는다."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_name(f".{path.name}.tmp-{os.getpid()}")
+    with open(tmp, "w", encoding="utf-8") as fh:
+        json.dump(obj, fh, ensure_ascii=False, indent=2)
+        fh.write("\n")
+        fh.flush()
+        os.fsync(fh.fileno())
+    os.chmod(tmp, mode)
+    os.replace(tmp, path)
+    _fsync_dir(path.parent)
+
+
+def read_json(path: Path, code: str) -> dict | None:
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    try:
+        data = json.loads(text)
+    except json.JSONDecodeError as e:
+        raise ClioError(code, f"읽을 수 없는 JSON입니다: {path} ({e})", path=str(path))
+    if not isinstance(data, dict):
+        raise ClioError(code, f"형식이 올바르지 않습니다: {path}", path=str(path))
+    return data
+
+
+def db_kind(db: Path) -> str:
+    """missing | sqlite | tombstone | other. 빈 파일은 SQLite가 새 DB로 취급한다."""
+    try:
+        with db.open("rb") as fh:
+            head = fh.read(len(TOMBSTONE_MAGIC))
+    except (FileNotFoundError, NotADirectoryError):
+        return "missing"
+    except IsADirectoryError:
+        return "other"
+    if not head or head.startswith(SQLITE_MAGIC):
+        return "sqlite"
+    if head.startswith(TOMBSTONE_MAGIC):
+        return "tombstone"
+    return "other"
+
+
+def read_marker(root: Path) -> dict | None:
+    return read_json(root / ROOT_MARKER, "marker_invalid")
+
+
+def new_marker(reason: str, **fields) -> dict:
+    return {"format": 1, "system": "ideas", "tool": "clio-idea-manager",
+            "root_id": str(uuid.uuid4()), "state": "active", "created_at": utc_now(),
+            "created_by": f"clio-idea-manager {CLIO_VERSION}", "reason": reason, **fields}
+
+
+def write_marker(root: Path, marker: dict) -> None:
+    write_json_atomic(root / ROOT_MARKER, marker)
+
+
+def ensure_marker(root: Path, reason: str) -> dict:
+    """위치 표시가 없는 기존(v1.2 이하) 폴더에 표시를 남긴다. 있으면 그대로 둔다."""
+    marker = read_marker(root)
+    if marker is None:
+        marker = new_marker(reason)
+        write_marker(root, marker)
+    return marker
+
+
+def root_state(root: Path) -> dict:
+    """한 데이터 폴더의 상태. 아무것도 쓰지 않는다."""
+    kind = db_kind(root / DB_NAME)
+    marker = read_marker(root)
+    retired = kind == "tombstone" or (marker or {}).get("state") == "retired"
+    return {"path": str(root), "exists": root.exists(), "db": kind, "marker": marker,
+            "root_id": (marker or {}).get("root_id"), "retired": retired,
+            "live": kind == "sqlite" and not retired,
+            "moved_to": (marker or {}).get("moved_to")}
+
+
+def read_pointer() -> dict | None:
+    ptr = read_json(pointer_path(), "pointer_invalid")
+    if ptr is not None and not ptr.get("data_dir"):
+        raise ClioError("pointer_invalid", f"위치 기록에 data_dir가 없습니다: {pointer_path()}")
+    return ptr
+
+
+def write_pointer(root: Path, root_id: str | None, reason: str,
+                  relocation_id: str | None = None) -> dict:
+    """정본 위치를 기록한다. 이전 값은 history에 남긴다."""
+    before = read_json(pointer_path(), "pointer_invalid")
+    history = list((before or {}).get("history", []))
+    if before:
+        history.append({k: before.get(k) for k in
+                        ("data_dir", "root_id", "reason", "relocation_id", "updated_at")})
+    ptr = {"format": 1, "system": "ideas", "data_dir": str(root), "root_id": root_id,
+           "reason": reason, "relocation_id": relocation_id, "updated_at": utc_now(),
+           "history": history[-20:]}
+    pointer_path().parent.mkdir(parents=True, exist_ok=True)
+    os.chmod(pointer_path().parent, 0o700)
+    write_json_atomic(pointer_path(), ptr)
+    return ptr
+
+
+def _follow_moves(root: Path, st: dict) -> tuple[Path, dict, list[str]]:
+    """이전된 옛 폴더면 표시를 따라 새 폴더로 간다.
+
+    새 폴더가 살아 있고 같은 이전 작업(relocation_id)으로 만들어졌을 때만 따른다.
+    """
+    chain: list[str] = []
+    for _ in range(4):
+        if not st["retired"]:
+            break
+        marker = st["marker"] or {}
+        nxt = marker.get("moved_to")
+        if not nxt:
+            break
+        nst = root_state(Path(nxt))
+        if not (nst["live"] and (nst["marker"] or {}).get("relocation_id")
+                == marker.get("relocation_id")):
+            break
+        chain.append(str(root))
+        root, st = Path(nxt), nst
+    return root, st, chain
+
+
+def _unfinished_from(st: dict) -> Path | None:
+    """이전 작업이 새 위치에 사본을 놓은 뒤 원본을 닫기 전에 멈췄으면 그 원본 경로.
+
+    사본의 위치 표시에 relocated_from이 있고 그 원본이 아직 살아 있으면, 원본이 정본이다.
+    """
+    src = ((st.get("marker") or {}).get("relocated_from") or {}).get("path")
+    if st.get("live") and src and root_state(Path(src))["live"]:
+        return Path(src)
+    return None
+
+
+def resolve_root(use_env: bool = True) -> dict:
+    """정본 데이터 폴더를 정한다. 아무것도 쓰지 않는다.
+
+    쓸 수 없는 상태면 problem에 사유를 담는다 (예외를 던지지 않는다).
+    """
+    env = os.environ.get("CLIO_DATA_DIR") if use_env else None
+    ptr = read_pointer()
+    legacy, default = legacy_root(), default_root()
+    warnings: list[dict] = []
+    problem = None
+    followed: list[str] = []
+
+    if env:
+        root = Path(env).expanduser()
+        source = "env"
+        st = root_state(root)
+        if st["retired"]:
+            problem = {"code": "root_retired",
+                       "message": f"{root}는 데이터를 옮긴 옛 위치입니다. 이곳에는 더 이상 쓰지 "
+                                  f"않습니다. 현재 위치: {st['moved_to'] or '알 수 없음'}. "
+                                  "CLIO_DATA_DIR을 새 위치로 바꾸거나 지우세요.",
+                       "moved_to": st["moved_to"]}
+        elif _unfinished_from(st):
+            problem = {"code": "relocation_unfinished",
+                       "message": f"{root}는 끝나지 않은 이전 작업이 놓아 둔 사본입니다. 정본은 아직 "
+                                  f"{_unfinished_from(st)}입니다. idea_relocate run으로 이전을 "
+                                  "마치거나 CLIO_DATA_DIR을 지우세요."}
+        if ptr and Path(ptr["data_dir"]) != root:
+            warnings.append({"code": "env_overrides_pointer",
+                             "message": f"CLIO_DATA_DIR({root})이 위치 기록({ptr['data_dir']})보다 "
+                                        "우선합니다. 환경 변수가 없는 실행(에이전트·예약 작업)은 "
+                                        "위치 기록을 씁니다."})
+    elif ptr:
+        source = "pointer"
+        root = Path(ptr["data_dir"]).expanduser()
+        st = root_state(root)
+        root, st, followed = _follow_moves(root, st)
+        if st["retired"]:
+            problem = {"code": "root_retired",
+                       "message": f"위치 기록이 가리키는 {root}는 이전된 옛 위치이고 새 위치를 "
+                                  "확인할 수 없습니다. idea_relocate status로 확인하세요.",
+                       "moved_to": st["moved_to"]}
+        elif st["db"] == "missing" and st["marker"] is None:
+            problem = {"code": "root_missing",
+                       "message": f"위치 기록이 가리키는 데이터 폴더가 없습니다: {root}. "
+                                  "외장 디스크 연결이나 이동 여부를 확인하세요. "
+                                  "빈 DB를 새로 만들지 않습니다."}
+        elif (not followed and ptr.get("root_id") and st["root_id"]
+              and ptr["root_id"] != st["root_id"]):
+            problem = {"code": "root_mismatch",
+                       "message": f"{root}의 위치 표시(root_id)가 위치 기록과 다릅니다. "
+                                  "다른 데이터로 바뀌었을 수 있어 사용하지 않습니다."}
+    else:
+        lst = root_state(legacy)
+        dst = root_state(default)
+        lroot, lst2, lchain = _follow_moves(legacy, lst)
+        if lst["live"] and dst["live"] and _unfinished_from(dst) == legacy:
+            # 이전이 사본을 놓은 뒤 원본을 닫기 전에 멈췄다. 원본이 아직 정본이다.
+            source, root, st = "legacy", legacy, lst
+            warnings.append({"code": "relocation_unfinished",
+                             "message": f"끝나지 않은 이전 작업이 있습니다 ({default}에 사본). "
+                                        "정본은 아직 옛 위치입니다. idea_relocate run으로 마치세요."})
+        elif lst["live"] and dst["live"]:
+            source, root, st = "legacy", legacy, lst
+            problem = {"code": "root_ambiguous",
+                       "message": f"기존 위치({legacy})와 새 기본 위치({default})에 모두 DB가 "
+                                  "있습니다. 어느 쪽이 정본인지 정할 수 없어 멈춥니다. "
+                                  "CLIO_DATA_DIR로 명시하거나 한쪽을 정리하세요."}
+        elif lst["live"]:
+            source, root, st = "legacy", legacy, lst
+        elif lst["db"] == "other" or (lst["marker"] and not lst["retired"]):
+            # 옛 위치에 알아볼 수 없는 DB나 위치 표시가 남아 있다. 새 기본 위치로 넘어가 빈 DB를
+            # 만들면 기존 데이터를 버리게 되므로 옛 위치에서 멈춘다 (아래 db_unrecognized/db_missing).
+            source, root, st = "legacy", legacy, lst
+        elif lchain:
+            source, root, st, followed = "legacy", lroot, lst2, lchain
+        elif lst["retired"] and not dst["live"]:
+            # 옛 위치는 이전됐다고 표시돼 있는데 새 위치를 찾지 못했다. 기본 위치에 빈 DB를
+            # 새로 만들면 이전된 데이터와 갈라지므로 멈춘다.
+            source, root, st = "legacy", legacy, lst
+            problem = {"code": "root_retired",
+                       "message": f"{legacy}는 이전된 옛 위치인데 새 위치"
+                                  f"({lst['moved_to'] or '알 수 없음'})를 찾지 못했습니다. "
+                                  "idea_relocate status로 확인하세요.",
+                       "moved_to": lst["moved_to"]}
+        else:
+            source, root, st = "default", default, dst
+            if st["retired"]:
+                problem = {"code": "root_retired",
+                           "message": f"새 기본 위치 {default}가 이전된 옛 위치로 표시되어 "
+                                      "있습니다. idea_relocate status로 확인하세요.",
+                           "moved_to": st["moved_to"]}
+
+    if not problem and st["db"] == "other":
+        problem = {"code": "db_unrecognized",
+                   "message": f"{root / DB_NAME}이 SQLite 데이터베이스가 아닙니다."}
+    if not problem and st["db"] == "missing" and st["marker"] and not st["retired"]:
+        problem = {"code": "db_missing",
+                   "message": f"데이터 폴더 표시는 있는데 DB가 없습니다: {root / DB_NAME}. "
+                              "데이터가 옮겨졌거나 지워졌을 수 있어 빈 DB를 새로 만들지 않습니다."}
+    if source != "legacy" and not env:
+        lst = root_state(legacy)
+        if lst["live"] and Path(root) != legacy:
+            warnings.append({"code": "legacy_db_present",
+                             "message": f"옛 위치({legacy})에 이전 표시가 없는 DB가 남아 있습니다. "
+                                        "현재는 쓰지 않습니다."})
+    return {"path": Path(root), "source": source, "source_label": SOURCE_LABELS[source],
+            "state": st, "followed": followed, "problem": problem, "warnings": warnings,
+            "env": env, "pointer": ptr}
+
+
+_RES_CACHE: dict = {}
+
+
+def invalidate_resolution() -> None:
+    _RES_CACHE.clear()
+
+
+def resolution() -> dict:
+    key = (os.environ.get("CLIO_DATA_DIR"), str(home()))
+    if key not in _RES_CACHE:
+        _RES_CACHE[key] = resolve_root()
+    return _RES_CACHE[key]
+
+
 def data_dir() -> Path:
-    return Path(os.environ.get("CLIO_DATA_DIR", "~/ClioData")).expanduser()
+    res = resolution()
+    if res["problem"]:
+        p = res["problem"]
+        raise ClioError(p["code"], p["message"], data_dir=str(res["path"]),
+                        **{k: v for k, v in p.items() if k not in ("code", "message")})
+    return res["path"]
 
 
 def load_config() -> dict:
     cfg = json.loads(json.dumps(DEFAULT_CONFIG))
-    path = data_dir() / "config.json"
+    try:
+        path = data_dir() / "config.json"
+    except (ClioError, OSError):
+        return cfg          # 위치 문제는 DB를 여는 명령이 보고한다
     if path.exists():
         user = json.loads(path.read_text(encoding="utf-8"))
         for k, v in user.items():
@@ -89,14 +446,55 @@ def load_config() -> dict:
     return cfg
 
 
-class ClioError(Exception):
-    """도구 계층의 모든 실패. 종료 코드 1과 함께 JSON으로 보고된다."""
+# --------------------------------------------------------------------------
+# 데이터 폴더 잠금
+# --------------------------------------------------------------------------
+#
+# 모든 Clio 명령은 데이터 폴더의 .clio.lock에 공유 잠금을 잡는다. 이전·복구는 배타
+# 잠금을 잡으므로, 이전 중에는 다른 명령이 잠시 기다리다 실패한다 (성공처럼 보이지 않음).
 
-    def __init__(self, code: str, message: str, **extra):
-        super().__init__(message)
-        self.code = code
-        self.message = message
-        self.extra = extra
+_HELD_LOCKS: dict[str, int] = {}
+
+
+def lock_root(root: Path, exclusive: bool, timeout: float | None = None) -> int:
+    if timeout is None:
+        timeout = float(os.environ.get("CLIO_LOCK_TIMEOUT", "30"))
+    fd = os.open(root / LOCK_NAME, os.O_RDWR | os.O_CREAT, 0o600)
+    flag = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            fcntl.flock(fd, flag | fcntl.LOCK_NB)
+            return fd
+        except BlockingIOError:
+            if time.monotonic() >= deadline:
+                os.close(fd)
+                raise ClioError(
+                    "root_busy" if not exclusive else "writer_active",
+                    (f"데이터 이전·복구 작업이 진행 중입니다 ({root}). 잠시 후 다시 시도하세요."
+                     if not exclusive else
+                     f"실행 중인 Clio 작업이 있어 잠금을 얻지 못했습니다 ({root})."),
+                    data_dir=str(root))
+            time.sleep(0.1)
+
+
+def unlock_root(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
+def _hold_shared(root: Path) -> None:
+    key = str(root)
+    if key not in _HELD_LOCKS:
+        _HELD_LOCKS[key] = lock_root(root, exclusive=False)
+
+
+def _release_shared(root: Path) -> None:
+    fd = _HELD_LOCKS.pop(str(root), None)
+    if fd is not None:
+        unlock_root(fd)
 
 
 # --------------------------------------------------------------------------
@@ -247,12 +645,45 @@ CREATE VIRTUAL TABLE IF NOT EXISTS search_fts USING fts5(
 """
 
 
+def _check_creatable(res: dict) -> None:
+    """DB가 없을 때 새로 만들어도 되는 상황인지 판정한다.
+
+    기존 데이터가 있었다는 흔적(위치 표시, 위치 기록)이 있으면 빈 DB를 만들지 않는다.
+    기존 설치를 새 설치로 오인해 초기화하는 사고를 막는다.
+    """
+    root, st = res["path"], res["state"]
+    db = root / DB_NAME
+    if st["marker"]:
+        raise ClioError("db_missing",
+                        f"데이터 폴더 표시는 있는데 DB가 없습니다: {db}. "
+                        "데이터가 옮겨졌거나 지워졌을 수 있어 빈 DB를 새로 만들지 않습니다.",
+                        data_dir=str(root))
+    if res["source"] == "pointer":
+        raise ClioError("root_missing",
+                        f"위치 기록이 가리키는 곳에 DB가 없습니다: {db}. 빈 DB를 새로 만들지 않습니다.",
+                        data_dir=str(root))
+
+
 def connect(create: bool = True) -> sqlite3.Connection:
-    d = data_dir()
-    db = d / "ideas.db"
-    if not db.exists() and not create:
-        raise ClioError("db_missing", f"데이터베이스가 없습니다: {db}")
-    d.mkdir(parents=True, exist_ok=True)
+    for _ in range(3):
+        root = data_dir()
+        res = resolution()
+        db = root / DB_NAME
+        if res["state"]["db"] == "missing":
+            if not create:
+                raise ClioError("db_missing", f"데이터베이스가 없습니다: {db}")
+            _check_creatable(res)
+        if not root.exists():
+            root.mkdir(parents=True, mode=0o700)
+        _hold_shared(root)
+        # 잠금을 기다리는 동안 이전이 끝났을 수 있다. 위치를 다시 판정한다.
+        invalidate_resolution()
+        if data_dir() == root and resolution()["state"]["db"] == res["state"]["db"]:
+            break
+        _release_shared(root)
+    else:
+        raise ClioError("root_unstable", "데이터 위치가 바뀌는 중입니다. 잠시 후 다시 시도하세요.")
+    new = res["state"]["db"] == "missing"
     conn = sqlite3.connect(db, isolation_level=None, timeout=10.0)
     conn.row_factory = sqlite3.Row
     conn.executescript(SCHEMA_SQL)
@@ -261,6 +692,9 @@ def connect(create: bool = True) -> sqlite3.Connection:
         "ON CONFLICT(key) DO NOTHING",
         (str(SCHEMA_VERSION),),
     )
+    if new:
+        ensure_marker(root, "init:new")
+        invalidate_resolution()
     return conn
 
 
@@ -658,6 +1092,12 @@ def run_cli(build_parser, dispatch) -> None:
         # 데이터 디렉터리에 접근할 수 없는 경우 등. 성공한 것처럼 응답하지 않는다 (TC9).
         print(json.dumps(
             {"ok": False, "error": {"code": "storage_unavailable", "message": str(e)}},
+            ensure_ascii=False, indent=2))
+        sys.exit(1)
+    except Exception as e:  # noqa: BLE001 — 예상 못 한 오류도 JSON 실패로 알린다 (성공처럼 보이지 않게)
+        print(json.dumps(
+            {"ok": False, "error": {"code": "internal_error",
+                                    "message": f"{type(e).__name__}: {e}"}},
             ensure_ascii=False, indent=2))
         sys.exit(1)
 

@@ -8,125 +8,111 @@ import json
 import os
 import shutil
 import sqlite3
-import subprocess
 import sys
-from datetime import datetime
+import tempfile
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 from clio_core import (  # noqa: E402
-    CLIO_VERSION, ClioError, connect, data_dir, now_iso, run_cli, sha256_file, sha256_text,
+    CLIO_VERSION, DB_NAME, ClioError, connect, data_dir, ensure_marker, invalidate_resolution,
+    pointer_path, read_marker, read_pointer, resolution, resolve_root, run_cli, write_pointer,
 )
-
-COUNT_TABLES = ["idea", "raw_entry", "revision", "idea_relation", "tag", "idea_tag",
-                "source", "attachment", "action_log"]
+from clio_ops import (  # noqa: E402
+    COUNT_TABLES, counts, create_backup, fingerprint, mirror_backup, open_db, prune,
+    read_registry_entry, registry_path, restore_copy, run_integrity, verify_backup,
+)
 
 
 def _open(path) -> sqlite3.Connection:
     """검사·대조용 읽기 연결. run_integrity는 Row 팩토리를 전제한다."""
-    conn = sqlite3.connect(path)
-    conn.row_factory = sqlite3.Row
-    return conn
+    return open_db(path)
 
 
 # --------------------------------------------------------------------------
-# 무결성 검사 (PRD §9.4)
+# 데이터 위치 (v1.3.0)
 # --------------------------------------------------------------------------
 
-def run_integrity(conn) -> dict:
-    problems = []
+def _describe(st: dict) -> dict:
+    m = st["marker"] or {}
+    return {"path": st["path"], "exists": st["exists"], "db": st["db"],
+            "marker_state": m.get("state"), "root_id": m.get("root_id"),
+            "moved_to": m.get("moved_to"), "live": st["live"]}
 
-    def add(kind, detail):
-        problems.append({"check": kind, "detail": detail})
 
-    # 1. 원문 해시 일치
-    for r in conn.execute("SELECT id, body, body_hash FROM raw_entry WHERE redacted_at IS NULL"):
-        if sha256_text(r["body"]) != r["body_hash"]:
-            add("raw_body_hash", f"entry {r['id']}의 본문 해시가 일치하지 않습니다")
-
-    # 2. latest_revision_id가 최대 rev_no를 가리키는가
-    for r in conn.execute(
-        "SELECT i.id, i.ref, i.latest_revision_id, "
-        "(SELECT id FROM revision WHERE idea_id=i.id ORDER BY rev_no DESC LIMIT 1) AS top "
-        "FROM idea i WHERE i.deleted_at IS NULL"):
-        if r["top"] is not None and r["latest_revision_id"] != r["top"]:
-            add("latest_revision", f"{r['ref']}의 latest_revision_id가 최신 revision과 다릅니다")
-        if r["top"] is None and r["latest_revision_id"] is not None:
-            add("latest_revision", f"{r['ref']}가 존재하지 않는 revision을 가리킵니다")
-
-    # 3. 고아 레코드
-    orphan_sql = {
-        "revision": "SELECT COUNT(*) c FROM revision r LEFT JOIN idea i ON i.id=r.idea_id WHERE i.id IS NULL",
-        "idea_relation_from": "SELECT COUNT(*) c FROM idea_relation r LEFT JOIN idea i ON i.id=r.from_idea_id WHERE i.id IS NULL",
-        "idea_relation_to": "SELECT COUNT(*) c FROM idea_relation r LEFT JOIN idea i ON i.id=r.to_idea_id WHERE i.id IS NULL",
-        "idea_tag": "SELECT COUNT(*) c FROM idea_tag it LEFT JOIN idea i ON i.id=it.idea_id WHERE i.id IS NULL",
-        "raw_entry": "SELECT COUNT(*) c FROM raw_entry e WHERE e.idea_id IS NOT NULL "
-                     "AND NOT EXISTS (SELECT 1 FROM idea i WHERE i.id=e.idea_id)",
-        "attachment": "SELECT COUNT(*) c FROM attachment a LEFT JOIN raw_entry e ON e.id=a.raw_entry_id WHERE e.id IS NULL",
+def where_report() -> dict:
+    """정본 위치와 그 근거, 충돌 진단. 아무것도 쓰지 않는다."""
+    from clio_core import default_root, legacy_root, root_state
+    res = resolve_root()
+    noenv = resolve_root(use_env=False) if res["env"] else res
+    reg = read_registry_entry(registry_path())
+    if reg.get("operational_root"):
+        reg["agrees"] = Path(reg["operational_root"]) == res["path"]
+    return {
+        "data_dir": str(res["path"]), "source": res["source"],
+        "source_label": res["source_label"], "usable": res["problem"] is None,
+        "problem": res["problem"], "warnings": res["warnings"],
+        "followed_from": res["followed"], "state": _describe(res["state"]),
+        "env": res["env"],
+        "without_env": None if not res["env"] else {
+            "data_dir": str(noenv["path"]), "source": noenv["source"],
+            "problem": noenv["problem"]},
+        "pointer": {"path": str(pointer_path()), "content": res["pointer"]},
+        "candidates": {"legacy": _describe(root_state(legacy_root())),
+                       "default": _describe(root_state(default_root()))},
+        "registry": {"path": str(registry_path()), **reg},
+        "clio_version": CLIO_VERSION,
     }
-    for name, sql in orphan_sql.items():
-        n = conn.execute(sql).fetchone()["c"]
-        if n:
-            add("orphan", f"{name}에 고아 레코드 {n}건")
 
-    # 4. ref 중복·누락
-    refs = [r["ref"] for r in conn.execute("SELECT ref FROM idea")]
-    if len(refs) != len(set(refs)):
-        add("ref_duplicate", "글감 번호가 중복되었습니다")
-    nums = sorted(int(x.rsplit("-", 1)[1]) for x in refs if "-" in x)
-    if nums:
-        missing = sorted(set(range(1, nums[-1] + 1)) - set(nums))
-        if missing:
-            add("ref_gap", f"번호 공백 {len(missing)}건 (tombstone 삭제 시 정상): {missing[:10]}")
 
-    # 5. 미분류 원문
-    unassigned = conn.execute(
-        "SELECT COUNT(*) c FROM raw_entry WHERE assign_state='unassigned' "
-        "AND redacted_at IS NULL").fetchone()["c"]
+def cmd_where(args, cfg):
+    rep = where_report()
+    if args.strict and not rep["usable"]:
+        p = rep["problem"]
+        raise ClioError(p["code"], p["message"], data_dir=rep["data_dir"])
+    return rep
 
-    # 6. 대칭 관계 정규화
-    for r in conn.execute(
-        "SELECT id, from_idea_id, to_idea_id FROM idea_relation "
-        "WHERE symmetric=1 AND from_idea_id > to_idea_id"):
-        add("symmetry", f"relation {r['id']}의 대칭 관계 정규화가 깨졌습니다")
 
-    # 7. 첨부 파일 해시·존재
-    for r in conn.execute("SELECT * FROM attachment WHERE redacted_at IS NULL"):
-        p = data_dir() / r["stored_path"]
-        if not p.exists():
-            add("attachment_missing", f"첨부 파일 없음: {r['stored_path']}")
-        elif sha256_file(p) != r["sha256"]:
-            add("attachment_hash", f"첨부 해시 불일치: {r['stored_path']}")
-
-    pragma = conn.execute("PRAGMA integrity_check").fetchone()[0]
-    if pragma != "ok":
-        add("sqlite", pragma)
-
-    counts = {t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"] for t in COUNT_TABLES}
-    return {"healthy": not problems, "problem_count": len(problems), "problems": problems,
-            "unassigned_entries": unassigned, "counts": counts,
-            "clio_version": CLIO_VERSION}
-
+# --------------------------------------------------------------------------
+# 초기화
+# --------------------------------------------------------------------------
 
 def cmd_init(args, cfg):
-    """데이터베이스와 디렉터리를 만든다. 이미 있으면 그대로 둔다 (멱등)."""
-    existed = (data_dir() / "ideas.db").exists()
+    """데이터베이스와 디렉터리를 만든다. 이미 있으면 그대로 둔다 (멱등).
+
+    --pin: 기존 설치(legacy)나 새 기본 위치(default)로 판정됐고 위치 기록이 없으면
+    지금 위치를 기록해 둔다. 이후 기본값이 바뀌어도 정본이 흔들리지 않는다.
+    """
+    res = resolution()
+    root = data_dir()
+    if args.expect_root and Path(args.expect_root).expanduser() != root:
+        raise ClioError("root_changed",
+                        f"설치가 판정한 위치({args.expect_root})와 지금 위치({root})가 다릅니다.")
+    existed = (root / DB_NAME).exists()
     conn = connect(create=True)
-    for sub in ("attachments", "exports", "backups"):
-        (data_dir() / sub).mkdir(parents=True, exist_ok=True)
+    marker = ensure_marker(root, "init:legacy" if existed else "init:new")
+    for sub in ("attachments", "exports"):
+        (root / sub).mkdir(parents=True, exist_ok=True)
+    pinned = None
+    if args.pin and res["source"] in ("legacy", "default") and read_pointer() is None:
+        reason = "install:legacy" if res["source"] == "legacy" else (
+            "install:existing" if existed else "install:new")
+        write_pointer(root, marker["root_id"], reason)
+        invalidate_resolution()
+        pinned = {"path": str(pointer_path()), "reason": reason}
     version = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
-    counts = {t: conn.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
-              for t in COUNT_TABLES}
-    return {"data_dir": str(data_dir()), "created": not existed,
-            "clio_version": CLIO_VERSION,
-            "schema_version": version["value"] if version else None, "counts": counts,
+    return {"data_dir": str(root), "source": res["source"],
+            "source_label": res["source_label"], "created": not existed,
+            "root_id": marker["root_id"], "pinned": pinned,
+            "warnings": res["warnings"], "clio_version": CLIO_VERSION,
+            "schema_version": version["value"] if version else None, "counts": counts(conn),
             "message": ("데이터베이스를 새로 만들었습니다." if not existed
                         else "기존 데이터베이스를 그대로 사용합니다.")}
 
 
 def cmd_integrity(args, cfg):
     conn = connect(create=False)
-    result = run_integrity(conn)
+    result = run_integrity(conn, data_dir())
+    result["data_dir"] = str(data_dir())
     if not result["healthy"] and args.strict:
         raise ClioError("integrity_failed", f"무결성 문제 {result['problem_count']}건",
                         problems=result["problems"])
@@ -137,145 +123,71 @@ def cmd_integrity(args, cfg):
 # 백업 (PRD §9.3)
 # --------------------------------------------------------------------------
 
-def _snapshot(src_conn, dest: Path):
-    """실행 중인 DB 파일을 복사하지 않고 sqlite3 백업 API로 스냅샷을 뜬다."""
-    dest.parent.mkdir(parents=True, exist_ok=True)
-    target = sqlite3.connect(dest)
-    try:
-        src_conn.backup(target)
-    finally:
-        target.close()
-
-
-def _copy_tree(src: Path, dst: Path):
-    if not src.exists():
-        return 0
-    n = 0
-    for p in src.rglob("*"):
-        if p.is_file():
-            rel = p.relative_to(src)
-            out = dst / rel
-            out.parent.mkdir(parents=True, exist_ok=True)
-            try:
-                os.link(p, out)
-            except OSError:
-                shutil.copy2(p, out)
-            n += 1
-    return n
-
-
-def _prune(backup_root: Path, cfg):
-    """일 7 / 주 4 / 월 12 rolling 보존."""
-    dirs = sorted([d for d in backup_root.iterdir() if d.is_dir() and d.name[0].isdigit()],
-                  reverse=True)
-    keep, seen_w, seen_m = set(), set(), set()
-    ret = cfg["backup_retention"]
-    for i, d in enumerate(dirs):
-        try:
-            when = datetime.strptime(d.name[:15], "%Y%m%dT%H%M%S")
-        except ValueError:
-            keep.add(d)
-            continue
-        if i < ret["daily"]:
-            keep.add(d)
-        wk = when.strftime("%G-W%V")
-        if wk not in seen_w and len(seen_w) < ret["weekly"]:
-            seen_w.add(wk); keep.add(d)
-        mo = when.strftime("%Y-%m")
-        if mo not in seen_m and len(seen_m) < ret["monthly"]:
-            seen_m.add(mo); keep.add(d)
-    removed = []
-    for d in dirs:
-        if d not in keep:
-            shutil.rmtree(d, ignore_errors=True)
-            removed.append(d.name)
-    return removed
-
-
-def _redaction_manifest(conn, backup_root: Path, ts: str):
-    """영구 삭제 사실을 백업과 함께 보존한다 (PRD §9.2).
-
-    기존 백업 파일은 소급 수정하지 않는다. 복구 시 이 목록을 재적용한다.
-    """
-    path = backup_root / "redaction_manifest.json"
-    items = []
-    for r in conn.execute("SELECT id, redacted_at, body_hash FROM raw_entry "
-                          "WHERE redacted_at IS NOT NULL"):
-        items.append({"kind": "raw_entry", "entry_id": r["id"],
-                      "redacted_at": r["redacted_at"], "body_hash": r["body_hash"]})
-    for r in conn.execute("SELECT ref, deleted_at FROM idea WHERE deleted_at IS NOT NULL"):
-        items.append({"kind": "idea", "ref": r["ref"], "deleted_at": r["deleted_at"]})
-    path.write_text(json.dumps({"updated_at": ts, "entries": items},
-                               ensure_ascii=False, indent=2), encoding="utf-8")
-    return len(items)
-
-
 def cmd_backup(args, cfg):
     conn = connect(create=False)
-    ts = now_iso(cfg)
-    stamp = datetime.fromisoformat(ts).strftime("%Y%m%dT%H%M%S")
-    root = Path(args.out).expanduser() if args.out else data_dir() / "backups"
-    dest = root / stamp
-    dest.mkdir(parents=True, exist_ok=True)
-
-    _snapshot(conn, dest / "ideas.db")
-    here = Path(__file__).resolve().parent
-    env = dict(os.environ, CLIO_DATA_DIR=str(data_dir()))
-    subprocess.run([sys.executable, str(here / "idea_export"), "json",
-                    "--out", str(dest / "clio-export.json")], check=True,
-                   capture_output=True, env=env)
-    subprocess.run([sys.executable, str(here / "idea_export"), "md",
-                    "--out", str(dest / "markdown")], check=True,
-                   capture_output=True, env=env)
-    n_att = _copy_tree(data_dir() / "attachments", dest / "attachments")
-    n_red = _redaction_manifest(conn, root, ts)
-
-    snap = _open(dest / "ideas.db")
-    verify = run_integrity(snap)
-    counts = {t: snap.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
-              for t in COUNT_TABLES}
-    snap.close()
-    (dest / "manifest.json").write_text(json.dumps(
-        {"created_at": ts, "counts": counts, "attachments": n_att,
-         "db_sha256": sha256_file(dest / "ideas.db")},
-        ensure_ascii=False, indent=2), encoding="utf-8")
-
-    removed = _prune(root, cfg)
-    mirrored = None
-    if not args.no_mirror and cfg.get("backup_mirror"):
-        mpath = Path(cfg["backup_mirror"]).expanduser() / stamp
-        if mpath.parent.parent.exists():
-            mpath.mkdir(parents=True, exist_ok=True)
-            _copy_tree(dest, mpath)
-            shutil.copy2(root / "redaction_manifest.json",
-                         mpath.parent / "redaction_manifest.json")
-            mirrored = str(mpath)
-    return {"path": str(dest), "counts": counts, "attachments": n_att,
-            "redaction_entries": n_red, "pruned": removed, "mirrored_to": mirrored,
-            "verified": verify["healthy"]}
+    root = data_dir()
+    backup_root = Path(args.out or cfg["backup_root"]).expanduser()
+    marker = read_marker(root) or {}
+    bk = create_backup(conn, root, backup_root, cfg, kind="routine",
+                       root_id=marker.get("root_id"))
+    removed = prune(backup_root, cfg)
+    mirror = ({"status": "disabled", "mirrored_to": None} if args.no_mirror
+              else mirror_backup(Path(bk["path"]), backup_root, cfg.get("backup_mirror")))
+    return {**bk, "backup_root": str(backup_root), "pruned": removed,
+            "mirrored_to": mirror["mirrored_to"], "mirror": mirror}
 
 
 def cmd_restore_test(args, cfg):
-    """백업으로 새 DB를 복구한 뒤 건수를 대조한다 (TC7)."""
+    """백업을 격리된 사본으로 복원해 검증한다 (TC7).
+
+    1) 검증 목록의 모든 파일 해시 대조  2) 사본 복원(DB·첨부)  3) 무결성(첨부 포함)
+    4) 백업 당시 지문 대조  5) 운영 DB와 건수 대조(참고용)
+    운영 데이터에는 아무것도 쓰지 않는다.
+    """
     src = Path(args.source).expanduser()
-    db = src / "ideas.db" if src.is_dir() else src
+    bdir = src if src.is_dir() else src.parent
+    db = bdir / DB_NAME if src.is_dir() else src
     if not db.exists():
         raise ClioError("backup_missing", f"백업 데이터베이스가 없습니다: {db}")
-    live = connect(create=False)
-    live_counts = {t: live.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
-                   for t in COUNT_TABLES}
-    restored = _open(":memory:")
-    src_conn = sqlite3.connect(db)
-    src_conn.backup(restored)
-    src_conn.close()
-    r_counts = {t: restored.execute(f"SELECT COUNT(*) c FROM {t}").fetchone()["c"]
-                for t in COUNT_TABLES}
-    integ = run_integrity(restored)
-    diff = {t: {"live": live_counts[t], "restored": r_counts[t]}
-            for t in COUNT_TABLES if live_counts[t] != r_counts[t]}
-    return {"source": str(db), "match": not diff, "diff": diff,
-            "restored_counts": r_counts, "restored_healthy": integ["healthy"],
-            "note": "차이는 백업 이후 추가된 기록일 수 있습니다."}
+    files = verify_backup(bdir)
+    try:
+        manifest = json.loads((bdir / "manifest.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        manifest = {}
+
+    keep = Path(args.restore_to).expanduser() if args.restore_to else None
+    if keep and keep.exists() and any(keep.iterdir()):
+        raise ClioError("restore_target_not_empty", f"복원 위치가 비어 있지 않습니다: {keep}")
+    out = keep or Path(tempfile.mkdtemp(prefix="clio-restore-"))
+    try:
+        restore_copy(bdir, db, out)
+        restored = _open(out / DB_NAME)
+        r_counts = counts(restored)
+        integ = run_integrity(restored, out)
+        fp = fingerprint(restored)
+        restored.close()
+    finally:
+        if not keep:
+            shutil.rmtree(out, ignore_errors=True)
+    fp_match = (fp["sha256"] == manifest["fingerprint"]["sha256"]
+                if manifest.get("fingerprint") else None)
+
+    live_counts, diff = None, {}
+    try:
+        live = connect(create=False)
+        live_counts = counts(live)
+        diff = {t: {"live": live_counts[t], "restored": r_counts[t]}
+                for t in COUNT_TABLES if live_counts[t] != r_counts[t]}
+    except ClioError:
+        pass
+    verified = (integ["healthy"] and files["verified"] is not False and fp_match is not False)
+    return {"source": str(db), "verified": verified,
+            "manifest_verified": files["verified"], "files_checked": files["files_checked"],
+            "file_problems": files["problems"], "fingerprint_match": fp_match,
+            "restored_healthy": integ["healthy"], "restored_problems": integ["problems"],
+            "restored_counts": r_counts, "restored_to": str(keep) if keep else None,
+            "match": not diff, "diff": diff, "live_counts": live_counts,
+            "note": "운영 DB와의 차이는 백업 이후 추가된 기록일 수 있습니다."}
 
 
 # --------------------------------------------------------------------------
@@ -359,17 +271,23 @@ def cmd_calibrate(args, cfg):
 def build_parser():
     p = argparse.ArgumentParser(prog="idea_check", description="Clio 운영 안정성")
     sub = p.add_subparsers(dest="cmd")
+    w = sub.add_parser("where", help="정본 데이터 위치와 판정 근거 (쓰기 없음)")
+    w.add_argument("--strict", action="store_true", help="쓸 수 없는 상태면 종료 코드 1")
+    w.set_defaults(fn=cmd_where)
     n = sub.add_parser("init", help="데이터 디렉터리와 스키마 생성 (멱등)")
+    n.add_argument("--pin", action="store_true", help="판정된 위치를 위치 기록 파일에 고정")
+    n.add_argument("--expect-root", help="이 위치가 아니면 아무것도 만들지 않고 실패")
     n.set_defaults(fn=cmd_init)
     i = sub.add_parser("integrity", help="무결성 검사 (PRD §9.4)")
     i.add_argument("--strict", action="store_true", help="문제가 있으면 종료 코드 1")
     i.set_defaults(fn=cmd_integrity)
-    b = sub.add_parser("backup", help="백업 생성 (PRD §9.3)")
-    b.add_argument("--out")
+    b = sub.add_parser("backup", help="백업 생성 + 검증 (PRD §9.3)")
+    b.add_argument("--out", help="백업 루트 (기본: config의 backup_root)")
     b.add_argument("--no-mirror", action="store_true")
     b.set_defaults(fn=cmd_backup)
-    r = sub.add_parser("restore-test", help="백업 복구 시험 (TC7)")
+    r = sub.add_parser("restore-test", help="백업 복원 시험 (TC7)")
     r.add_argument("--source", required=True)
+    r.add_argument("--restore-to", help="격리 사본을 남길 빈 폴더 (기본: 임시 폴더 후 삭제)")
     r.set_defaults(fn=cmd_restore_test)
     c = sub.add_parser("reconcile", help="채널 이력 대조용 보고")
     c.add_argument("--since")

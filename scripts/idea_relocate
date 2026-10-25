@@ -1,0 +1,1670 @@
+#!/usr/bin/env python3
+"""idea_relocate — 데이터 위치 이전과 복구 (v1.3.0).
+
+    plan      실제로 무엇을 할지 보여준다. 아무것도 쓰지 않는다 (dry-run).
+    run       이전을 실행한다. 중간에 멈췄으면 같은 명령으로 안전하게 이어간다.
+    status    현재 위치, 이전 기록, 옛 위치 차단 여부, 전환 후 새 기록 여부.
+    rollback  옛 위치로 되돌린다. 전환 후 새 기록이 있으면 그 기록까지 함께 옮긴다.
+
+순서 (run):
+  1. 사전 점검 — 경로·공간·권한·충돌·쓰기 주체·예약 작업
+  2. 원본 폴더 배타 잠금 → 열린 파일·최근 쓰기 확인 (통제되지 않은 writer가 있으면 중단)
+  3. 새 백업 루트에 백업 + 검증 목록 + 즉시 검증
+  4. 임시 폴더(staging)에 SQLite 백업 API로 스냅샷, 첨부·설정 해시 검증 복사
+  5. staging 검증 — 지문(행 단위 해시)·무결성·파일 목록 대조, 필요한 경로만 보정
+  6. 전환 — staging을 새 위치로 rename, 옛 DB는 이름을 바꿔 보존하고 그 자리에 차단 파일,
+     위치 기록 갱신
+  7. 새 위치 검증 → registry의 ideas 항목만 잠금 갱신 → 완료 기록
+
+각 단계는 <원본>/relocation/<id>.json에 기록된다. 이전 원본은 지우지 않는다.
+"""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import shutil
+import sqlite3
+import sys
+import tempfile
+from datetime import datetime
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from clio_core import (  # noqa: E402
+    CLIO_VERSION, DB_NAME, LOCK_NAME, ROOT_MARKER, TOMBSTONE_MAGIC, ClioError, db_kind,
+    default_root, ensure_marker, home, invalidate_resolution, legacy_root, lock_root,
+    new_marker, now_iso, pointer_path, read_json, read_marker, read_pointer, resolve_root,
+    root_state, run_cli, sha256_file, unlock_root, utc_now, write_json_atomic, write_marker,
+    write_pointer,
+)
+from clio_ops import (  # noqa: E402
+    IGNORABLE, copy_file_verified, copy_tree_verified, counts, create_backup, fingerprint,
+    fingerprint_diff, free_bytes, hash_tree, last_write_age, lock_holders, open_db,
+    open_handles, problem_set, read_registry_entry, registry_path, run_integrity,
+    same_device, scan_references, skill_version, snapshot, tree_bytes, update_registry,
+    writable,
+)
+
+CRASH_ENV = "CLIO_RELOCATE_CRASH_AT"      # 시험용 장애 주입. 운영에서는 쓰지 않는다.
+SWITCH_PHASES = ("switching", "target_placed", "source_retired", "pointer_set",
+                 "registry_done")
+COPY_ENTRIES = {"attachments": "첨부 원본", "exports": "내보내기(파생 산출물)",
+                "config.json": "설정"}
+KEEP_REASONS = {
+    "skill-prev": "직전 스킬 코드 보관본 — 데이터가 아니므로 옮기지 않는다",
+    "backups": "옛 로컬 백업 — 옛 위치에 그대로 둔다",
+    "relocation": "이전 기록",
+    LOCK_NAME: "잠금 파일",
+    ROOT_MARKER: "위치 표시 (새 위치에는 새로 만든다)",
+}
+DB_FILES = (DB_NAME, f"{DB_NAME}-wal", f"{DB_NAME}-shm")
+MIN_FREE_DEFAULT = 64 * 1024 * 1024
+
+
+def crash_point(name: str) -> None:
+    if os.environ.get(CRASH_ENV) == name:
+        os._exit(70)
+
+
+def _abs(p) -> Path:
+    return Path(os.path.abspath(Path(p).expanduser()))
+
+
+def _under(p: Path, root: Path) -> bool:
+    try:
+        Path(p).relative_to(root)
+        return True
+    except ValueError:
+        return False
+
+
+def _ver_tuple(v: str | None) -> tuple:
+    try:
+        return tuple(int(x) for x in (v or "").split("."))
+    except ValueError:
+        return (0,)
+
+
+# --------------------------------------------------------------------------
+# 이전 기록 (journal)
+# --------------------------------------------------------------------------
+
+class Journal:
+    def __init__(self, path: Path, data: dict):
+        self.path, self.data = path, data
+
+    @classmethod
+    def create(cls, root: Path, data: dict) -> "Journal":
+        d = root / "relocation"
+        d.mkdir(parents=True, exist_ok=True)
+        os.chmod(d, 0o700)
+        j = cls(d / f"{data['id']}.json", data)
+        data.setdefault("history", [])
+        j.phase(data.get("phase", "planned"))
+        return j
+
+    def save(self) -> None:
+        write_json_atomic(self.path, self.data)
+
+    def update(self, **fields) -> None:
+        self.data.update(fields)
+        self.save()
+
+    def phase(self, name: str, **fields) -> None:
+        self.data["phase"] = name
+        self.data["history"].append({"phase": name, "at": utc_now()})
+        self.data.update(fields)
+        self.save()
+
+    def finish(self, state: str, **fields) -> None:
+        self.data["state"] = state
+        self.data["finished_at"] = utc_now()
+        self.data["history"].append({"phase": f"state:{state}", "at": utc_now()})
+        self.data.update(fields)
+        self.save()
+
+
+def journal_dirs(extra: list[Path]) -> list[Path]:
+    roots: list[Path] = list(extra) + [legacy_root(), default_root()]
+    try:
+        res = resolve_root()
+        roots += [res["path"]] + [Path(p) for p in res["followed"]]
+        ptr = res["pointer"] or {}
+    except (ClioError, OSError):
+        ptr = {}
+    roots += [Path(h["data_dir"]) for h in ptr.get("history", []) if h.get("data_dir")]
+    if ptr.get("data_dir"):
+        roots.append(Path(ptr["data_dir"]))
+    seen, out = set(), []
+    for r in roots:
+        d = _abs(r) / "relocation"
+        if str(d) not in seen:
+            seen.add(str(d))
+            out.append(d)
+    return out
+
+
+def load_journals(extra: list[Path]) -> list[Journal]:
+    found: dict[str, Journal] = {}
+    for d in journal_dirs(extra):
+        if not d.is_dir():
+            continue
+        for f in sorted(d.glob("*.json")):
+            try:
+                data = json.loads(f.read_text(encoding="utf-8"))
+            except (OSError, json.JSONDecodeError):
+                continue
+            if data.get("system") != "ideas" or "id" not in data:
+                continue
+            cur = found.get(data["id"])
+            # 같은 id가 두 곳(원본·새 위치)에 있으면 더 진행된 쪽을 쓴다
+            if cur is None or len(data.get("history", [])) > len(cur.data.get("history", [])):
+                found[data["id"]] = Journal(f, data)
+    return sorted(found.values(), key=lambda j: j.data.get("started_at", ""))
+
+
+def _brief(j: Journal) -> dict:
+    d = j.data
+    return {"id": d["id"], "kind": d.get("kind"), "state": d.get("state"),
+            "phase": d.get("phase"), "from": d.get("source", {}).get("root"),
+            "to": d.get("target", {}).get("root"), "started_at": d.get("started_at"),
+            "finished_at": d.get("finished_at"), "journal": str(j.path),
+            "error": d.get("error")}
+
+
+def new_id(cfg, source: Path, target: Path) -> str:
+    base = datetime.now(ZoneInfo(cfg["timezone"])).strftime("%Y%m%dT%H%M%S")
+    cand, n = base, 2
+    while ((source / "relocation" / f"{cand}.json").exists()
+           or (target / "relocation" / f"{cand}.json").exists()
+           or (source / f"{DB_NAME}.relocated-{cand}").exists()
+           or (target / f"{DB_NAME}.relocated-{cand}").exists()
+           or (target.parent / f".{target.name}.staging-{cand}").exists()):
+        cand = f"{base}-{n}"
+        n += 1
+    return cand
+
+
+# --------------------------------------------------------------------------
+# 조사 (읽기 전용)
+# --------------------------------------------------------------------------
+
+def read_copy(root: Path) -> tuple[sqlite3.Connection, Path]:
+    """원본을 건드리지 않고 읽기 위해 DB와 WAL을 임시 폴더에 복사해서 연다.
+
+    읽기 전용 연결도 WAL 모드에서는 -shm/-wal을 만들거나 닫을 때 체크포인트할 수 있어
+    dry-run이 원본 파일을 바꾸게 된다. 복사본을 열면 그런 일이 없다.
+    """
+    tmp = Path(tempfile.mkdtemp(prefix="clio-plan-"))
+    for name in (DB_NAME, f"{DB_NAME}-wal"):
+        if (root / name).exists():
+            shutil.copy2(root / name, tmp / name)
+    return open_db(tmp / DB_NAME), tmp
+
+
+def inventory(source: Path) -> dict:
+    copy, keep, unknown = [], [], []
+    for e in sorted(source.iterdir()) if source.is_dir() else []:
+        name = e.name
+        if name in IGNORABLE or name in DB_FILES:
+            continue
+        n, b = tree_bytes(e) if e.is_dir() else (1, e.stat().st_size)
+        if name in COPY_ENTRIES:
+            copy.append({"name": name, "what": COPY_ENTRIES[name], "files": n, "bytes": b})
+        elif name in KEEP_REASONS:
+            keep.append({"name": name, "reason": KEEP_REASONS[name], "files": n, "bytes": b})
+        elif name.startswith((f"{DB_NAME}.relocated-", f".{DB_NAME}.rollback-", "config.json.pre-")):
+            keep.append({"name": name, "reason": "이전·복구 때 보존한 옛 파일", "files": n, "bytes": b})
+        else:
+            unknown.append({"name": name, "files": n, "bytes": b})
+    inc = source / "attachments" / ".incoming"
+    return {"copy": copy, "keep": keep, "unknown": unknown,
+            "incoming_leftovers": tree_bytes(inc)[0] if inc.is_dir() else 0}
+
+
+def attachment_paths(conn, source: Path) -> dict:
+    rows = list(conn.execute("SELECT id, stored_path FROM attachment"))
+    absolute = [r for r in rows if os.path.isabs(r["stored_path"])]
+    inside = [r for r in absolute if _under(Path(r["stored_path"]), source)]
+    outside = [r for r in absolute if not _under(Path(r["stored_path"]), source)]
+    return {"rows": len(rows), "absolute": len(absolute), "inside_source": len(inside),
+            "outside_source": len(outside),
+            "outside_paths": [r["stored_path"] for r in outside][:50],
+            "policy": "원본 안을 가리키는 절대경로만 상대경로로 바꾼다. 밖을 가리키는 경로는 "
+                      "그대로 두고 확인 목록에 올린다."}
+
+
+HISTORICAL_COLUMNS = (("action_log", "payload"), ("source", "raw_payload"),
+                      ("raw_entry", "body"), ("revision", "body"))
+
+
+def historical_refs(conn, needles: list[str]) -> dict:
+    out = {}
+    for table, col in HISTORICAL_COLUMNS:
+        where = " OR ".join(f"instr(coalesce({col},''), ?) > 0" for _ in needles)
+        n = conn.execute(f"SELECT COUNT(*) FROM {table} WHERE {where}", needles).fetchone()[0]
+        if n:
+            out[f"{table}.{col}"] = n
+    return {"count": out,
+            "note": "과거 감사 기록·출처·원문·정제본에 적힌 경로는 역사 기록이므로 바꾸지 않는다."}
+
+
+def _looks_like_path(v: str) -> bool:
+    """절대경로나 ~ 경로만 경로로 본다. "Asia/Seoul" 같은 값을 작업 폴더 기준 경로로 오인하지 않는다."""
+    return v.startswith("/") or v == "~" or v.startswith("~/")
+
+
+def _walk_paths(obj, source: Path, target: Path, prefix=""):
+    """설정값 중 원본 폴더 안을 가리키는 경로 → 새 폴더 안의 같은 자리."""
+    out = []
+    if isinstance(obj, dict):
+        for k, v in obj.items():
+            if isinstance(v, (dict, list)):
+                out += _walk_paths(v, source, target, f"{prefix}{k}.")
+            elif isinstance(v, str) and _looks_like_path(v):
+                p = _abs(v)
+                if _under(p, source):
+                    out.append({"key": prefix + k, "old": v,
+                                "new": str(target / p.relative_to(source))})
+    return out
+
+
+def config_fixups(cfg_path: Path, source: Path, target: Path) -> list[dict]:
+    try:
+        obj = json.loads(cfg_path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return []
+    return _walk_paths(obj, source, target)
+
+
+def apply_config_fixups(cfg_path: Path, fixes: list[dict]) -> None:
+    if not fixes:
+        return
+    obj = json.loads(cfg_path.read_text(encoding="utf-8"))
+    for f in fixes:
+        cur = obj
+        keys = f["key"].split(".")
+        for k in keys[:-1]:
+            cur = cur[k]
+        cur[keys[-1]] = f["new"]
+    write_json_atomic(cfg_path, obj, mode=0o600)
+
+
+def apply_db_fixups(conn, source: Path) -> list[dict]:
+    """현재 파일 참조(attachment.stored_path)만, 원본 안 절대경로 → 상대경로."""
+    fixes = []
+    for r in conn.execute("SELECT id, stored_path FROM attachment"):
+        p = r["stored_path"]
+        if os.path.isabs(p) and _under(Path(p), source):
+            fixes.append({"table": "attachment", "column": "stored_path", "id": r["id"],
+                          "old": p, "new": Path(p).relative_to(source).as_posix()})
+    if fixes:
+        conn.execute("BEGIN IMMEDIATE")
+        for f in fixes:
+            conn.execute("UPDATE attachment SET stored_path=? WHERE id=?", (f["new"], f["id"]))
+        conn.execute("COMMIT")
+    return fixes
+
+
+def target_state(target: Path, replace_retired: bool = False) -> dict:
+    if not target.exists():
+        return {"state": "absent", "conflict": False}
+    if not target.is_dir():
+        return {"state": "not_a_directory", "conflict": True}
+    entries = [e.name for e in target.iterdir() if e.name not in IGNORABLE]
+    if not entries:
+        return {"state": "empty", "conflict": False}
+    if entries == [ROOT_MARKER] and _is_placeholder(target):
+        return {"state": "empty", "conflict": False, "placeholder": True}
+    st = root_state(target)
+    if st["retired"]:
+        return {"state": "retired_root", "conflict": not replace_retired,
+                "entries": len(entries), "marker": st["marker"]}
+    if st["live"]:
+        return {"state": "live_root", "conflict": True, "entries": len(entries),
+                "marker": st["marker"]}
+    return {"state": "occupied", "conflict": True, "entries": len(entries),
+            "sample": sorted(entries)[:10]}
+
+
+def skill_dir() -> Path:
+    return Path(os.environ.get("CLIO_SKILL_DIR", "~/.claude/skills/clio-idea-manager")).expanduser()
+
+
+def writers_report(source: Path, quiet: float) -> dict:
+    sd = skill_dir()
+    installed = skill_version(sd) if (sd / "scripts" / "clio_core.py").exists() else None
+    tools = [{"what": "설치된 Clio 도구 (에이전트가 호출)", "path": str(sd),
+              "version": installed,
+              "lock_aware": installed is not None and _ver_tuple(installed) >= (1, 3, 0)}
+             if installed else
+             {"what": "설치된 Clio 도구", "path": str(sd), "version": None,
+              "note": "설치본을 찾지 못했습니다 (CLIO_SKILL_DIR로 위치 지정 가능)"}]
+    tools.append({"what": "이 도구", "path": str(Path(__file__).resolve().parent.parent),
+                  "version": CLIO_VERSION, "lock_aware": True})
+    copies = []
+    if (source / "skill-prev" / "scripts" / "clio_core.py").exists():
+        copies.append({"path": str(source / "skill-prev"),
+                       "version": skill_version(source / "skill-prev"),
+                       "note": "롤백용 코드 사본. 잠금과 새 위치를 모르므로 전환 중 실행하지 않는다. "
+                               "전환 후에는 옛 위치의 차단 파일 때문에 실패한다."})
+    agents = []
+    oc = home() / ".openclaw" / "openclaw.json"
+    try:
+        entries = json.loads(oc.read_text(encoding="utf-8")).get("agents", {}).get("entries", {})
+        for name, a in entries.items():
+            if "clio" in name.lower():
+                agents.append({"what": f"OpenClaw 에이전트 '{name}'",
+                               "workspace": a.get("workspace")})
+    except (OSError, json.JSONDecodeError, AttributeError):
+        pass
+    age = last_write_age(source)
+    return {"lock": lock_holders(source),
+            "open_handles": open_handles([source / f for f in DB_FILES]),
+            "last_write_age_seconds": age, "quiet_seconds_required": quiet,
+            "tools": tools, "legacy_code_copies": copies, "agents": agents}
+
+
+# --------------------------------------------------------------------------
+# plan
+# --------------------------------------------------------------------------
+
+def build_plan(args, cfg) -> dict:
+    blockers, warnings = [], []
+
+    def block(code, message, **kw):
+        blockers.append({"code": code, "message": message, **kw})
+
+    def warn(code, message, **kw):
+        warnings.append({"code": code, "message": message, **kw})
+
+    res = None
+    if args.from_:
+        source, how = _abs(args.from_), "--from"
+    else:
+        res = resolve_root()
+        source, how = _abs(res["path"]), res["source"]
+        if res["problem"] and res["problem"]["code"] != "root_retired":
+            block(res["problem"]["code"], res["problem"]["message"])
+        warnings += res["warnings"]
+        if res["env"]:
+            warn("env_set", f"CLIO_DATA_DIR={res['env']}가 설정되어 있습니다. 전환 후에는 이 값을 "
+                            "새 위치로 바꾸거나 지워야 합니다 (옛 위치는 차단되어 실패합니다).")
+    target = _abs(args.to) if args.to else default_root()
+    backup_root = _abs(args.backup_root or cfg["backup_root"])
+
+    journals = load_journals([source, target])
+    unfinished = [j for j in journals if j.data.get("state") == "running"
+                  and j.data.get("kind") == "migrate"]
+    base = {"mode": "dry-run", "clio_version": CLIO_VERSION,
+            "journals": {"unfinished": [_brief(j) for j in unfinished],
+                         "recent": [_brief(j) for j in journals[-5:]]},
+            "_unfinished": unfinished}
+    rb_running = [j for j in journals if j.data.get("kind") == "rollback"
+                  and j.data.get("state") == "running"]
+    if rb_running:
+        block("rollback_in_progress", "멈춘 복구 작업이 있습니다. idea_relocate rollback을 먼저 "
+                                      "다시 실행해 끝내세요.", rollback=_brief(rb_running[-1]))
+        return {**base, "source": {"root": str(source), "how": how},
+                "target": {"root": str(target)}, "blockers": blockers, "warnings": warnings,
+                "ready": False, "summary_lines": [b["message"] for b in blockers]}
+
+    sst = root_state(source)
+    if source == target or (sst["retired"] and sst["moved_to"]
+                            and _abs(sst["moved_to"]) == target):
+        return {**base, "already": True, "source": {"root": str(source), "how": how},
+                "target": {"root": str(target)}, "blockers": [], "warnings": warnings,
+                "ready": False,
+                "message": f"이미 {target}를 정본으로 쓰고 있습니다. 옮길 것이 없습니다."}
+
+    if _under(target, source) or _under(source, target):
+        block("path_nesting", "원본과 대상이 서로의 안에 있습니다.")
+    if not sst["live"]:
+        block("source_unusable", f"원본 {source}에 쓸 수 있는 DB가 없습니다 (상태: {sst['db']}"
+                                 f"{', 이전된 옛 위치' if sst['retired'] else ''}).")
+        return {**base, "source": {"root": str(source), "how": how, "state": sst["db"]},
+                "target": {"root": str(target)}, "blockers": blockers, "warnings": warnings,
+                "ready": False}
+
+    # 원본 내용 — 복사본으로 읽는다 (원본 파일 불변)
+    conn, tmp = read_copy(source)
+    try:
+        fp = fingerprint(conn)
+        integ = run_integrity(conn, source)
+        apaths = attachment_paths(conn, source)
+        scan = (scan_references(source, args.scan) if not args.no_scan
+                else {"links_to_review": [], "schedules": [], "crontab": "skipped", "needles": []})
+        hist = historical_refs(conn, scan["needles"] or [str(source)])
+        cnt = counts(conn)
+        journal_mode = conn.execute("PRAGMA journal_mode").fetchone()[0]
+    finally:
+        conn.close()
+        shutil.rmtree(tmp, ignore_errors=True)
+
+    if not integ["healthy"]:
+        if args.accept_source_problems:
+            warn("source_problems_accepted",
+                 f"원본에 이미 있는 무결성 문제 {integ['problem_count']}건을 그대로 옮깁니다. "
+                 "새 위치에서 같은 문제만 있는지 대조합니다.", problems=integ["problems"])
+        else:
+            block("source_problems", f"원본 무결성 문제 {integ['problem_count']}건. 원인을 먼저 "
+                                     "확인하세요. 그대로 옮기려면 --accept-source-problems.",
+                  problems=integ["problems"])
+    if apaths["outside_source"]:
+        warn("attachment_outside_source",
+             f"원본 밖을 가리키는 첨부 경로 {apaths['outside_source']}건은 옮기지 않습니다.")
+
+    inv = inventory(source)
+    if inv["unknown"]:
+        warn("unknown_entries", "원본에 Clio가 모르는 항목이 있어 옮기지 않습니다: "
+             + ", ".join(e["name"] for e in inv["unknown"]), entries=inv["unknown"])
+
+    tst = target_state(target, args.replace_retired)
+    if tst["conflict"]:
+        block("target_conflict", f"대상 {target}이 비어 있지 않습니다 ({tst['state']}). "
+                                 "덮어쓰지 않습니다.", target_state=tst)
+    elif tst["state"] == "retired_root":
+        warn("replace_retired", f"대상 {target}은 이전에 은퇴한 위치입니다. 옆으로 옮겨 보존한 뒤 "
+                                "새로 채웁니다.")
+
+    # 공간
+    db_b = sum((source / f).stat().st_size for f in (DB_NAME, f"{DB_NAME}-wal")
+               if (source / f).exists())
+    copy_b = sum(e["bytes"] for e in inv["copy"])
+    stage_need = db_b + copy_b
+    backup_need = db_b * 3 + copy_b + 1024 * 1024
+    min_free = args.min_free_bytes
+    space = {"source_db_bytes": db_b, "copy_bytes": copy_b, "staging_bytes": stage_need,
+             "backup_bytes_estimate": backup_need, "min_free_bytes": min_free,
+             "target_free_bytes": free_bytes(target.parent),
+             "backup_free_bytes": free_bytes(backup_root)}
+    if same_device(target.parent, backup_root):
+        need = stage_need + backup_need
+        space["shared_device"] = True
+        ok = space["target_free_bytes"] - need >= min_free
+    else:
+        space["shared_device"] = False
+        ok = (space["target_free_bytes"] - stage_need >= min_free
+              and space["backup_free_bytes"] - backup_need >= min_free)
+    space["ok"] = ok
+    if not ok:
+        block("insufficient_space", "디스크 공간이 부족합니다.", space=space)
+
+    # 권한
+    perms = {"source_writable": os.access(source, os.W_OK | os.X_OK),
+             "source_db_readable": os.access(source / DB_NAME, os.R_OK),
+             "target_parent_writable": writable(target.parent),
+             "target_writable": (os.access(target, os.W_OK | os.X_OK) if target.exists()
+                                 else None),
+             "backup_root_writable": writable(backup_root),
+             "pointer_dir_writable": writable(pointer_path().parent)}
+    reg_path = _abs(args.registry) if args.registry else registry_path()
+    reg = read_registry_entry(reg_path)
+    perms["registry_writable"] = (writable(reg_path.parent) and os.access(reg_path, os.R_OK)
+                                  if reg.get("exists") else None)
+    bad = [k for k, v in perms.items() if v is False and k != "registry_writable"]
+    if bad:
+        block("permission_denied", "권한이 없습니다: " + ", ".join(bad), permissions=perms)
+    if perms["registry_writable"] is False:
+        warn("registry_not_writable", "registry를 갱신할 수 없습니다. 결과를 Chris에게 전달합니다.")
+
+    # 쓰기 주체·예약
+    writers = writers_report(source, args.quiet_seconds)
+    if writers["lock"]["busy"]:
+        block("writer_active", "지금 실행 중인 Clio 명령이 데이터 폴더 잠금을 쥐고 있습니다.")
+    if writers["open_handles"]["pids"]:
+        block("writer_active", "다른 프로세스가 DB 파일을 열고 있습니다: "
+              + ", ".join(f"{p}({c})" for p, c in writers["open_handles"]["processes"].items()))
+    elif writers["open_handles"]["method"] != "lsof":
+        warn("handles_unverified", writers["open_handles"].get("note", "열린 파일 확인 불가"))
+    age = writers["last_write_age_seconds"]
+    if age is not None and age < args.quiet_seconds:
+        warn("recent_writes", f"{age}초 전에 쓰기가 있었습니다. 실행 시점에 {args.quiet_seconds}초 "
+                              "이상 조용해야 전환합니다.")
+    for t in writers["tools"]:
+        if t.get("version") and not t.get("lock_aware"):
+            msg = (f"설치된 도구가 v{t['version']}입니다. 이 버전은 새 위치를 모르고 잠금도 "
+                   "잡지 않으므로, 전환 후 옛 위치의 차단 파일 때문에 모든 명령이 실패합니다. "
+                   "먼저 update로 v1.3.0 이상을 설치하세요.")
+            if args.allow_old_tools:
+                warn("old_tools_installed", msg)
+            else:
+                block("old_tools_installed", msg + " (그래도 진행하려면 --allow-old-tools)")
+    pinned = [s for s in scan["schedules"] if s["pins_old_root"]]
+    if pinned:
+        warn("schedule_pins_old_root", "옛 경로를 직접 적은 예약 작업이 있습니다. 전환 후 실패하므로 "
+                                       "경로를 고쳐야 합니다.", schedules=pinned)
+    if reg.get("planned_root") and _abs(reg["planned_root"]) != target:
+        warn("registry_planned_differs",
+             f"registry의 계획 위치({reg['planned_root']})와 대상({target})이 다릅니다.")
+
+    ptr_before = read_pointer()
+    est = round(2 + (db_b * 4 + copy_b * 3) / (50 * 1024 * 1024), 1)
+    staging = target.parent / f".{target.name}.staging-<id>"
+    plan = {
+        **base,
+        "ready": not blockers,
+        "source": {"root": str(source), "how": how, "root_id": sst["root_id"],
+                   "db": {"bytes": (source / DB_NAME).stat().st_size,
+                          "wal_bytes": (source / f"{DB_NAME}-wal").stat().st_size
+                          if (source / f"{DB_NAME}-wal").exists() else None,
+                          "journal_mode": journal_mode},
+                   "counts": cnt, "fingerprint": fp["sha256"], "refs": fp["refs"],
+                   "integrity": {"healthy": integ["healthy"], "problems": integ["problems"]},
+                   "inventory": inv},
+        "target": {"root": str(target), **tst},
+        "staging": str(staging),
+        "backup": {"root": str(backup_root), "dir": f"{backup_root}/<시각>",
+                   "contents": ["ideas.db(백업 API 스냅샷)", "attachments/", "config.json",
+                                "clio-export.json", "markdown/", "manifest.json(파일별 크기·sha256)"],
+                   "mirror": "외부 미러는 쓰지 않는다 (이 작업 범위 밖)"},
+        "pointer": {"path": str(pointer_path()),
+                    "before": (ptr_before or {}).get("data_dir"), "after": str(target)},
+        "registry": {"path": str(reg_path), **reg,
+                     "will_update": (not args.no_registry and reg.get("exists", False)
+                                     and reg.get("readable", False) and reg.get("format_ok", False)),
+                     "fields": ["operational_roots.ideas", "cutovers.ideas"]},
+        "writers": writers,
+        "schedules": scan["schedules"], "crontab": scan["crontab"],
+        "interruption": {
+            "scope": "Clio 명령(idea_store·idea_search·idea_export·idea_check)만 잠시 멈춘다. "
+                     "이전이 잠금을 쥔 동안 새 명령은 최대 CLIO_LOCK_TIMEOUT(기본 30초) 기다렸다가 "
+                     "실패를 보고한다. 다른 비서·메일·캘린더에는 영향 없음.",
+            "estimate_seconds": est},
+        "absolute_paths": {"attachment.stored_path": apaths},
+        "historical_refs": hist,
+        "links_to_review": scan["links_to_review"],
+        "space": space, "permissions": perms,
+        "blockers": blockers, "warnings": warnings,
+        "steps": [
+            "원본 데이터 폴더 배타 잠금, 열린 파일·최근 쓰기 재확인",
+            f"새 백업: {backup_root}/<시각>/ (검증 목록 포함, 즉시 검증)",
+            f"임시 폴더 {staging}에 스냅샷·첨부·설정 복사 (해시 검증)",
+            "지문·무결성·파일 목록 대조, 원본 안 절대경로만 상대경로로 보정",
+            f"전환: 임시 폴더 → {target}, 옛 DB는 ideas.db.relocated-<id>로 보존하고 "
+            "그 자리에 차단 파일, 위치 기록 갱신",
+            "새 위치 검증 → registry의 ideas 항목만 잠금 갱신 → 완료 기록",
+        ],
+        "recovery": {
+            "before_switch": "원본은 그대로다. 같은 run을 다시 실행하면 남은 임시 폴더를 치우고 처음부터 한다.",
+            "after_switch_no_writes": "idea_relocate rollback — 보존한 옛 DB를 검증한 뒤 되살리고 "
+                                      "위치 기록을 되돌린다.",
+            "after_switch_with_writes": "idea_relocate rollback — 새 위치를 먼저 백업하고, 새 기록이 "
+                                        "옛 DB의 후속인지 검증한 뒤 최신 데이터를 옛 위치로 옮긴다. "
+                                        "옛 DB로 단순 복귀하지 않는다.",
+            "code_downgrade": "코드 되돌리기(skill-prev)와 데이터 위치 되돌리기는 별개다. "
+                              "구버전 도구는 위치 기록을 모르므로 옛 위치의 차단 파일에서 멈춘다. "
+                              "구버전으로 새 위치를 쓰려면 CLIO_DATA_DIR을 명시한다.",
+        },
+        "commands": {"run": "scripts/idea_relocate run", "status": "scripts/idea_relocate status",
+                     "rollback_preview": "scripts/idea_relocate rollback --dry-run",
+                     "rollback": "scripts/idea_relocate rollback"},
+    }
+    lines = [f"원본: {source} ({how})", f"대상: {target} ({tst['state']})",
+             f"기록: 글감 {cnt['idea']} · 원문 {cnt['raw_entry']} · 첨부 {cnt['attachment']}",
+             f"백업: {backup_root}/<시각>/", f"예상 중단: 약 {est}초 (Clio 명령만)"]
+    lines += [f"차단: {b['message']}" for b in blockers]
+    lines += [f"주의: {w['message']}" for w in warnings]
+    lines.append("실행 가능" if not blockers else "실행 불가 — 위 차단 사유를 먼저 해결하세요")
+    plan["summary_lines"] = lines
+    return plan
+
+
+def _public(plan: dict) -> dict:
+    return {k: v for k, v in plan.items() if not k.startswith("_")}
+
+
+def cmd_plan(args, cfg):
+    return _public(build_plan(args, cfg))
+
+
+# --------------------------------------------------------------------------
+# 전환 보조
+# --------------------------------------------------------------------------
+
+def tombstone_text(moved_to: Path, rid: str, kept: str) -> str:
+    return (f"{TOMBSTONE_MAGIC.decode()} — this file is not a database.\n"
+            "이 폴더는 이전이 끝난 Clio 아이디어 데이터의 옛 위치입니다.\n"
+            f"현재 데이터: {moved_to}\n"
+            f"relocation: {rid}\n"
+            f"at: {utc_now()}\n"
+            f"보존한 옛 DB: {kept} (지우지 않았습니다)\n"
+            "v1.3.0 이전 Clio 도구는 여기서 의도적으로 멈춥니다. 확인: idea_relocate status\n")
+
+
+def retire_root(root: Path, rid: str, moved_to: Path) -> dict:
+    """옛 DB를 지우지 않고 이름을 바꿔 보존하고, 그 자리에 차단 파일을 둔다 (멱등).
+
+    hard link로 원본 inode를 새 이름에 먼저 걸고, 차단 파일을 rename으로 교체한다.
+    ideas.db라는 이름이 비는 순간이 없으므로 구버전 도구가 그 틈에 빈 DB를 만들 수 없다.
+    """
+    db = root / DB_NAME
+    kept = root / f"{DB_NAME}.relocated-{rid}"
+    kind = db_kind(db)
+    if kind == "sqlite":
+        if not kept.exists():
+            try:
+                os.link(db, kept)
+            except OSError:
+                copy_file_verified(db, kept)
+        tomb = root / f".{DB_NAME}.tombstone-{rid}"
+        tomb.write_text(tombstone_text(moved_to, rid, kept.name), encoding="utf-8")
+        os.chmod(tomb, 0o444)
+        os.replace(tomb, db)
+    elif kind != "tombstone":
+        raise ClioError("retire_failed", f"차단할 DB 상태가 예상과 다릅니다: {db} ({kind})")
+    for suf in ("-wal", "-shm"):
+        side = root / f"{DB_NAME}{suf}"
+        if side.exists():
+            os.replace(side, root / f"{kept.name}{suf}")
+    marker = read_marker(root) or new_marker("retired-without-marker")
+    marker.update(state="retired", moved_to=str(moved_to), retired_at=utc_now(),
+                  retired_db=kept.name, relocation_id=rid)
+    write_marker(root, marker)
+    return {"root": str(root), "kept_db": str(kept), "tombstone": str(db)}
+
+
+def sqlite_refuses(db: Path) -> bool:
+    try:
+        c = sqlite3.connect(f"file:{db}?mode=ro", uri=True)
+        try:
+            c.execute("SELECT count(*) FROM sqlite_master").fetchone()
+        finally:
+            c.close()
+        return False
+    except sqlite3.DatabaseError:
+        return True
+
+
+def _is_placeholder(root: Path) -> bool:
+    try:
+        return bool((read_marker(root) or {}).get("placeholder")) and db_kind(root / DB_NAME) == "missing"
+    except ClioError:
+        return False
+
+
+def place_target(staging: Path, target: Path) -> None:
+    """staging을 대상 이름으로 rename. 대상이 빈 폴더면 그 자리를 대신한다."""
+    if target.exists():
+        placeholder = _is_placeholder(target)
+        for e in target.iterdir():
+            if e.name in IGNORABLE:
+                os.replace(e, staging / e.name)
+            elif e.name == ROOT_MARKER and placeholder:
+                e.unlink()      # 복구가 남긴 은퇴 표시뿐인 빈 자리
+        target.rmdir()          # 비어 있지 않으면 OSError — 덮어쓰지 않는다
+    os.rename(staging, target)
+
+
+def cleanup_staging(staging: Path, rid: str) -> bool:
+    """우리가 만든 임시 폴더만 지운다 (표시 파일로 확인)."""
+    if not staging.is_dir():
+        return False
+    tag = read_json(staging / ".clio-staging", "staging_invalid") or {}
+    mk = read_json(staging / ROOT_MARKER, "marker_invalid") or {}
+    if tag.get("relocation_id") == rid or mk.get("relocation_id") == rid:
+        shutil.rmtree(staging)
+        return True
+    return False
+
+
+def ensure_quiet(root: Path, quiet: float) -> None:
+    h = open_handles([root / f for f in DB_FILES])
+    if h["pids"]:
+        raise ClioError("writer_active", "다른 프로세스가 DB 파일을 열고 있어 중단합니다: "
+                        + ", ".join(f"{p}({c})" for p, c in h["processes"].items()),
+                        open_handles=h)
+    age = last_write_age(root)
+    if age is not None and age < quiet:
+        raise ClioError("recent_writes", f"{age}초 전에 쓰기가 있었습니다. {quiet}초 이상 조용할 때 "
+                        "다시 실행하세요.", last_write_age_seconds=age)
+
+
+def checkpoint_truncate(conn) -> None:
+    busy, _, _ = conn.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchone()
+    if busy:
+        raise ClioError("writer_active", "다른 연결이 DB를 쓰고 있어 체크포인트를 끝내지 못했습니다.")
+
+
+def _cfg_sha(root: Path) -> str | None:
+    p = root / "config.json"
+    return sha256_file(p) if p.is_file() else None
+
+
+# --------------------------------------------------------------------------
+# run
+# --------------------------------------------------------------------------
+
+def cmd_run(args, cfg):
+    plan = build_plan(args, cfg)
+    switch_pending = [j for j in plan["_unfinished"] if j.data.get("phase") in SWITCH_PHASES]
+    resumed_from = None
+    if switch_pending:
+        out = resume_switch(args, cfg, switch_pending[-1])
+        if out is not None:
+            return out
+        resumed_from = switch_pending[-1].data["id"]
+        plan = build_plan(args, cfg)
+    if plan.get("already"):
+        return {"already_migrated": True, "data_dir": plan["target"]["root"],
+                "message": plan["message"], "changed": False}
+    if plan["blockers"]:
+        raise ClioError("preflight_failed", "사전 점검을 통과하지 못해 아무것도 바꾸지 않았습니다.",
+                        blockers=plan["blockers"], warnings=plan["warnings"],
+                        summary_lines=plan["summary_lines"])
+    return do_migrate(args, cfg, plan, resumed_from)
+
+
+def do_migrate(args, cfg, plan, resumed_from=None):
+    source, target = Path(plan["source"]["root"]), Path(plan["target"]["root"])
+    backup_root = Path(plan["backup"]["root"])
+    reg_path = Path(plan["registry"]["path"])
+    src_lock = tgt_lock = None
+    src_conn = None
+    j = None
+    staging = None
+    try:
+        src_lock = lock_root(source, exclusive=True, timeout=args.lock_wait)
+        # 잠금을 얻었다 = 살아 있는 다른 이전 작업은 없다. 전환 전에 멈춘 기록은 정리한다.
+        abandoned = []
+        for old in plan["_unfinished"]:
+            if old.data.get("phase") not in SWITCH_PHASES:
+                cleanup_staging(Path(old.data.get("staging", "/nonexistent")), old.data["id"])
+                old.finish("abandoned", note="전환 전에 멈춘 작업. 원본은 바뀌지 않았고 임시 폴더를 치웠다.")
+                abandoned.append(old.data["id"])
+        rid = new_id(cfg, source, target)
+        staging = target.parent / f".{target.name}.staging-{rid}"
+        j = Journal.create(source, {
+            "format": 1, "id": rid, "kind": "migrate", "system": "ideas", "state": "running",
+            "clio_version": CLIO_VERSION, "started_at": utc_now(),
+            "source": {"root": str(source), "how": plan["source"]["how"]},
+            "target": {"root": str(target), "prior_state": plan["target"]["state"]},
+            "staging": str(staging), "backup_root": str(backup_root),
+            "registry": str(reg_path),
+            "options": {"quiet_seconds": args.quiet_seconds,
+                        "accept_source_problems": args.accept_source_problems,
+                        "replace_retired": args.replace_retired,
+                        "no_registry": args.no_registry},
+            "resumed_from": resumed_from, "abandoned": abandoned,
+            "plan_warnings": plan["warnings"], "links_to_review": plan["links_to_review"],
+            "schedules": plan["schedules"], "historical_refs": plan["historical_refs"],
+            "absolute_paths": plan["absolute_paths"], "writers": plan["writers"],
+        })
+        j.phase("locked")
+        ensure_quiet(source, args.quiet_seconds)
+
+        src_conn = open_db(source / DB_NAME)
+        src_conn.execute("PRAGMA busy_timeout=5000")
+        src_marker = ensure_marker(source, "relocate:legacy")
+        fp_src = fingerprint(src_conn)
+        integ_src = run_integrity(src_conn, source)
+        if not integ_src["healthy"] and not args.accept_source_problems:
+            raise ClioError("source_problems", "원본 무결성 문제가 있어 중단합니다.",
+                            problems=integ_src["problems"])
+        j.update(source={**j.data["source"], "root_id": src_marker["root_id"]},
+                 fingerprint={"source": fp_src},
+                 source_integrity={"healthy": integ_src["healthy"],
+                                   "problems": integ_src["problems"]})
+
+        bk = create_backup(src_conn, source, backup_root, cfg, kind="relocation",
+                           relocation_id=rid, root_id=src_marker["root_id"])
+        if not bk["verified"]:
+            raise ClioError("backup_unverified", "새 백업을 검증하지 못해 중단합니다.",
+                            backup=bk["path"], verification=bk["verification"])
+        if bk["fingerprint"] != fp_src["sha256"]:
+            raise ClioError("backup_unverified", "백업 스냅샷의 지문이 원본과 다릅니다.",
+                            backup=bk["path"])
+        j.phase("backup_done", backup={"dir": bk["path"], "files": bk["files"],
+                                       "fingerprint": bk["fingerprint"],
+                                       "verified": bk["verified"]})
+        crash_point("after_backup")
+
+        if args.replace_retired and target.exists() and plan["target"]["state"] == "retired_root":
+            aside = target.parent / f".{target.name}.replaced-{rid}"
+            os.rename(target, aside)
+            j.update(replaced_retired_target=str(aside))
+        staging.mkdir(parents=True, mode=0o700)
+        (staging / ".clio-staging").write_text(json.dumps({"relocation_id": rid}),
+                                               encoding="utf-8")
+        tgt_lock = lock_root(staging, exclusive=True, timeout=1)
+        snapshot(src_conn, staging / DB_NAME)
+        copied = {}
+        for name in ("attachments", "exports"):
+            if (source / name).is_dir():
+                r = copy_tree_verified(source / name, staging / name,
+                                       skip_dirs={".incoming"} if name == "attachments" else set())
+                copied[name] = {"files": r["files"], "bytes": r["bytes"]}
+            else:
+                copied[name] = {"files": 0, "bytes": 0}
+            (staging / name).mkdir(exist_ok=True)       # 빈 폴더도 새 위치에 만든다
+        if (source / "config.json").is_file():
+            copied["config.json"] = copy_file_verified(source / "config.json",
+                                                       staging / "config.json")
+        j.phase("staged", copied=copied, source_config_sha256=_cfg_sha(staging))
+        crash_point("after_staging")
+
+        st = open_db(staging / DB_NAME)
+        try:
+            fp_stage = fingerprint(st)
+            if fp_stage["sha256"] != fp_src["sha256"]:
+                raise ClioError("verify_failed", "임시 사본의 지문이 원본과 다릅니다.",
+                                diff=fingerprint_diff(fp_src, fp_stage))
+            integ_stage = run_integrity(st, staging)
+            if problem_set(integ_stage) != problem_set(integ_src):
+                raise ClioError("verify_failed", "임시 사본의 무결성 결과가 원본과 다릅니다.",
+                                source=integ_src["problems"], staged=integ_stage["problems"])
+            src_files = hash_tree(source / "attachments", {".incoming"})
+            stg_files = hash_tree(staging / "attachments")
+            if src_files != stg_files:
+                raise ClioError("verify_failed", "첨부 파일 목록·해시가 원본과 다릅니다.")
+            db_fix = apply_db_fixups(st, source)
+            cfg_fix = config_fixups(staging / "config.json", source, target)
+            apply_config_fixups(staging / "config.json", cfg_fix)
+            fp_fixed = fingerprint(st)
+            integ_fixed = run_integrity(st, staging)
+            if not set(problem_set(integ_fixed)) <= set(problem_set(integ_src)):
+                raise ClioError("verify_failed", "경로 보정 후 새 무결성 문제가 생겼습니다.",
+                                problems=integ_fixed["problems"])
+        finally:
+            st.close()
+        j.phase("verified", fingerprint={"source": fp_src, "staged": fp_stage,
+                                         "fixed": fp_fixed},
+                fixups={"db": db_fix, "config": cfg_fix},
+                staged_config_sha256=_cfg_sha(staging),
+                staged_attachments={k: v["sha256"] for k, v in stg_files.items()},
+                verification={"integrity_check": integ_stage["integrity_check"],
+                              "rows": {t: v["rows"] for t, v in fp_stage["tables"].items()},
+                              "refs": fp_stage["refs"], "fingerprint_matches_source": True,
+                              "files_hash_match": True,
+                              "problems_same_as_source": True,
+                              "pre_existing_problems": integ_src["problems"]})
+
+        # 전환 직전 재확인: 잠금을 모르는 쓰기 주체가 끼어들지 않았는가
+        if (fingerprint(src_conn)["sha256"] != fp_src["sha256"]
+                or _cfg_sha(source) != j.data.get("source_config_sha256")):
+            raise ClioError("source_changed", "복사하는 동안 원본이 바뀌었습니다. 다시 실행하세요.")
+        checkpoint_truncate(src_conn)
+        src_conn.close()
+        src_conn = None
+        ensure_quiet(source, 0)
+
+        j.phase("switching")
+        tmarker = new_marker("relocate", relocation_id=rid,
+                             relocated_from={"path": str(source), "root_id": src_marker["root_id"]})
+        write_marker(staging, tmarker)
+        (staging / ".clio-staging").unlink()
+        place_target(staging, target)
+        j.phase("target_placed", target={**j.data["target"], "root_id": tmarker["root_id"]})
+        crash_point("after_target_placed")
+
+        retire = retire_root(source, rid, target)
+        kept_fp = _fp_of(Path(retire["kept_db"]))
+        j.phase("source_retired", retire={**retire,
+                                          "kept_matches_source": kept_fp == fp_src["sha256"]})
+        crash_point("after_source_retired")
+
+        ptr_before = read_pointer()
+        write_pointer(target, tmarker["root_id"], "relocate", rid)
+        j.phase("pointer_set", pointer_before=ptr_before)
+        crash_point("after_pointer")
+        return finish(args, j, [src_lock, tgt_lock])
+    except BaseException as e:
+        if j is not None:
+            err = {"code": getattr(e, "code", type(e).__name__), "message": str(e)}
+            if j.data.get("phase") in SWITCH_PHASES:
+                j.update(error=err)     # 상태는 running — 다음 run이 이어서 처리한다
+            else:
+                if staging is not None:
+                    try:
+                        if tgt_lock is not None:
+                            unlock_root(tgt_lock)
+                            tgt_lock = None
+                        cleanup_staging(staging, j.data["id"])
+                    except OSError:
+                        pass
+                j.finish("failed", error=err,
+                         note="전환 전에 실패했다. 원본 데이터·설정은 바뀌지 않았다.")
+        if isinstance(e, ClioError) and j is not None:
+            e.extra.setdefault("relocation_id", j.data["id"])
+            e.extra.setdefault("journal", str(j.path))
+            if j.data.get("phase") in SWITCH_PHASES:
+                e.extra["next"] = "idea_relocate run 을 다시 실행하면 이어서 처리합니다."
+        raise
+    finally:
+        if src_conn is not None:
+            src_conn.close()
+        for fd in (tgt_lock, src_lock):
+            if fd is not None:
+                try:
+                    unlock_root(fd)
+                except OSError:
+                    pass
+
+
+def _fp_of(db: Path) -> str:
+    c = open_db(db)
+    try:
+        return fingerprint(c)["sha256"]
+    finally:
+        c.close()
+
+
+def finish(args, j: Journal, locks: list) -> dict:
+    """전환 후 검증, registry 갱신, 완료 기록. 잠금은 호출한 쪽이 푼다."""
+    source, target = Path(j.data["source"]["root"]), Path(j.data["target"]["root"])
+    rid = j.data["id"]
+    invalidate_resolution()
+    res = resolve_root(use_env=False)
+    c = open_db(target / DB_NAME)
+    try:
+        fp_now = fingerprint(c)
+        integ = run_integrity(c, target)
+    finally:
+        c.close()
+    fixed = j.data["fingerprint"]["fixed"]["sha256"]
+    pre = set(map(tuple, problem_set({"problems": j.data.get("source_integrity", {})
+                                      .get("problems", [])})))
+    post = {
+        "where": str(res["path"]), "source": res["source"],
+        "matches_target": _abs(res["path"]) == target,
+        "integrity_check": integ["integrity_check"],
+        "storage_ok": set(map(tuple, problem_set(integ))) <= pre,
+        "fingerprint": fp_now["sha256"], "fingerprint_matches_switch": fp_now["sha256"] == fixed,
+        "old_location_blocked": (db_kind(source / DB_NAME) == "tombstone"
+                                 and root_state(source)["retired"]
+                                 and sqlite_refuses(source / DB_NAME)),
+    }
+    if not (post["matches_target"] and post["storage_ok"] and post["old_location_blocked"]):
+        j.update(post_verification=post,
+                 error={"code": "post_verify_failed", "message": "전환 후 검증 실패"})
+        raise ClioError("post_verify_failed", "전환은 했지만 새 위치 검증에 실패했습니다. "
+                        "idea_relocate status로 확인하고 필요하면 rollback 하세요.",
+                        post_verification=post)
+    cut = {"state": "migrated", "relocation_id": rid, "from": str(source), "to": str(target),
+           "at": utc_now(), "backup": j.data.get("backup", {}).get("dir"), "verified": True,
+           "clio_version": CLIO_VERSION}
+    if j.data.get("options", {}).get("no_registry") or getattr(args, "no_registry", False):
+        reg = {"updated": False, "reason": "skipped_by_option",
+               "deliver_to_chris": {"operational_roots.ideas": str(target),
+                                    "cutovers.ideas": cut}}
+    else:
+        reg = update_registry(Path(j.data["registry"]), str(target), cut)
+    j.phase("registry_done", registry_update=reg, post_verification=post)
+    j.finish("done")
+    final = target / "relocation"
+    final.mkdir(exist_ok=True)
+    os.chmod(final, 0o700)
+    write_json_atomic(final / f"{rid}.json", j.data)
+    env = os.environ.get("CLIO_DATA_DIR")
+    return {
+        "relocated": True, "relocation_id": rid, "from": str(source), "to": str(target),
+        "data_dir": str(res["path"]), "backup": j.data.get("backup", {}).get("dir"),
+        "verification": j.data.get("verification"), "post_verification": post,
+        "post_switch_writes": not post["fingerprint_matches_switch"],
+        "fixups": j.data.get("fixups"), "kept_old_db": j.data.get("retire", {}).get("kept_db"),
+        "registry_update": reg, "links_to_review": j.data.get("links_to_review"),
+        "schedules": j.data.get("schedules"),
+        "journal": str(final / f"{rid}.json"),
+        "warnings": ([{"code": "env_still_set",
+                       "message": f"CLIO_DATA_DIR={env}가 아직 설정되어 있습니다. 새 위치로 바꾸거나 "
+                                  "지우세요."}] if env and _abs(env) != target else []),
+        "resumed_from": j.data.get("resumed_from"),
+        "message": f"{target}로 옮겼습니다. 옛 위치의 DB는 지우지 않고 보존했습니다.",
+    }
+
+
+def resume_switch(args, cfg, j: Journal):
+    """전환 도중 멈춘 작업을 이어간다. 처음부터 다시 해야 하면 정리하고 None을 돌려준다."""
+    source, target = Path(j.data["source"]["root"]), Path(j.data["target"]["root"])
+    staging = Path(j.data["staging"])
+    rid = j.data["id"]
+    locks = []
+    try:
+        locks.append(lock_root(source, exclusive=True, timeout=args.lock_wait))
+        tst = root_state(target) if target.exists() else None
+        placed = bool(tst and tst["live"] and (tst["marker"] or {}).get("relocation_id") == rid)
+        if placed:
+            locks.append(lock_root(target, exclusive=True, timeout=args.lock_wait))
+        if not placed:
+            cleanup_staging(staging, rid)
+            j.finish("abandoned", note="전환 직전에 멈췄다. 새 위치에 놓인 것이 없어 원본 그대로이며, "
+                                       "처음부터 다시 진행한다.")
+            return None
+        fp_src = j.data["fingerprint"]["source"]["sha256"]
+        fixed = j.data["fingerprint"]["fixed"]["sha256"]
+        sst = root_state(source)
+        if sst["live"]:
+            c = open_db(source / DB_NAME)
+            try:
+                now = fingerprint(c)["sha256"]
+                src_cfg = j.data.get("source_config_sha256", _cfg_sha(source))
+                if now != fp_src or _cfg_sha(source) != src_cfg:
+                    # 멈춘 사이 원본에 새 기록(또는 설정 변경)이 생겼다 → 놓아 둔 사본은 낡았다
+                    if (_fp_of(target / DB_NAME) != fixed
+                            or _cfg_sha(target) != j.data.get("staged_config_sha256")):
+                        raise ClioError("relocation_conflict",
+                                        "원본과 새 위치 양쪽이 바뀌었습니다. 자동으로 정하지 않습니다. "
+                                        "두 DB를 보존한 채 수동으로 확인하세요.",
+                                        source=str(source), target=str(target))
+                    for fd in locks[1:]:
+                        unlock_root(fd)
+                    locks = locks[:1]
+                    aside = target.parent / f".{target.name}.abandoned-{rid}"
+                    os.rename(target, aside)
+                    j.finish("abandoned", abandoned_copy=str(aside),
+                             note="멈춘 사이 원본에 새 기록이 생겨, 먼저 놓아 둔 사본을 옆으로 치우고 "
+                                  "처음부터 다시 진행한다.")
+                    return None
+                checkpoint_truncate(c)
+            finally:
+                c.close()
+            ensure_quiet(source, 0)
+        retire = retire_root(source, rid, target)
+        j.phase("source_retired", retire={**retire, "resumed": True,
+                                          "kept_matches_source":
+                                              _fp_of(Path(retire["kept_db"])) == fp_src})
+        tmarker = read_marker(target) or {}
+        ptr = read_pointer()
+        if not ptr or _abs(ptr["data_dir"]) != target or ptr.get("root_id") != tmarker.get("root_id"):
+            write_pointer(target, tmarker.get("root_id"), "relocate", rid)
+        j.phase("pointer_set", pointer_before=j.data.get("pointer_before", ptr))
+        out = finish(args, j, locks)
+        out["resumed"] = True
+        out["message"] = f"멈췄던 이전({rid})을 이어서 끝냈습니다. " + out["message"]
+        return out
+    finally:
+        for fd in locks:
+            try:
+                unlock_root(fd)
+            except OSError:
+                pass
+
+
+# --------------------------------------------------------------------------
+# status
+# --------------------------------------------------------------------------
+
+def cmd_status(args, cfg):
+    res = resolve_root()
+    noenv = resolve_root(use_env=False)
+    current = _abs(noenv["path"])
+    journals = load_journals([current] + ([_abs(args.from_)] if args.from_ else []))
+    done = [j for j in journals if j.data.get("kind") == "migrate"
+            and j.data.get("state") == "done" and _abs(j.data["target"]["root"]) == current]
+    latest = done[-1] if done else None
+    since = None
+    if latest and root_state(current)["live"]:
+        conn, tmp = read_copy(current)
+        try:
+            fp = fingerprint(conn)
+            since = {"fingerprint_now": fp["sha256"],
+                     "fingerprint_at_switch": latest.data["fingerprint"]["fixed"]["sha256"],
+                     "writes_after_switch": fp["sha256"] != latest.data["fingerprint"]["fixed"]["sha256"],
+                     "rows_now": {t: v["rows"] for t, v in fp["tables"].items()}}
+        finally:
+            conn.close()
+            shutil.rmtree(tmp, ignore_errors=True)
+    old = None
+    if latest:
+        src = Path(latest.data["source"]["root"])
+        st = root_state(src)
+        old = {"root": str(src), "retired": st["retired"], "db": st["db"],
+               "blocked": st["db"] == "tombstone" and sqlite_refuses(src / DB_NAME),
+               "kept_db": latest.data.get("retire", {}).get("kept_db"),
+               "kept_db_exists": Path(latest.data.get("retire", {}).get("kept_db", "/nonexistent")).exists()}
+    unfinished = [j for j in journals if j.data.get("state") == "running"]
+    advice = []
+    if unfinished:
+        advice.append("멈춘 작업이 있습니다. idea_relocate run 을 다시 실행하면 안전하게 이어가거나 "
+                      "처음부터 다시 합니다.")
+    if res["problem"]:
+        advice.append(res["problem"]["message"])
+    if res["env"] and _abs(res["path"]) != current:
+        advice.append(f"CLIO_DATA_DIR({res['env']})이 위치 기록과 다릅니다.")
+    return {
+        "data_dir": str(res["path"]), "source": res["source"], "problem": res["problem"],
+        "warnings": res["warnings"], "without_env": {"data_dir": str(current),
+                                                    "source": noenv["source"]},
+        "pointer": res["pointer"],
+        "latest_relocation": _brief(latest) if latest else None,
+        "since_switch": since, "old_root": old,
+        "unfinished": [_brief(j) for j in unfinished],
+        "history": [_brief(j) for j in journals[-10:]],
+        "registry": read_registry_entry(_abs(args.registry) if args.registry else registry_path()),
+        "advice": advice,
+    }
+
+
+# --------------------------------------------------------------------------
+# rollback
+# --------------------------------------------------------------------------
+
+def descendant_check(old, new) -> dict:
+    """새 DB가 옛 DB에 이어 쓴 결과인지 확인한다 (옛 기록이 사라지거나 바뀌지 않았는가).
+
+    허용하는 변화: 새 행 추가, action_log.undone_at 기록, raw_entry 영구 삭제(redact),
+    글감 상태·제목·태그 등 현재 상태 갱신. 원문·정제본·출처·감사 기록의 변조는 불허.
+    """
+    problems = []
+
+    def rows(conn, t):
+        return {r[0]: tuple(r) for r in conn.execute(f"SELECT rowid, * FROM {t}")}
+
+    def cols(conn, t):
+        return [c[1] for c in conn.execute(f"PRAGMA table_info({t})")]
+
+    for t in ("source", "revision"):
+        o, n = rows(old, t), rows(new, t)
+        for k, v in o.items():
+            if n.get(k) != v:
+                problems.append(f"{t} {k}이 바뀌거나 사라졌습니다")
+    c = cols(old, "action_log")
+    ui = 1 + c.index("undone_at")
+    o, n = rows(old, "action_log"), rows(new, "action_log")
+    for k, v in o.items():
+        nv = n.get(k)
+        if nv is None or v[:ui] + v[ui + 1:] != nv[:ui] + nv[ui + 1:] or (
+                v[ui] is not None and v[ui] != nv[ui]):
+            problems.append(f"action_log {k}이 바뀌거나 사라졌습니다")
+    c = cols(old, "raw_entry")
+    o, n = rows(old, "raw_entry"), rows(new, "raw_entry")
+    keep = [1 + c.index(x) for x in ("body_hash", "captured_at", "source_id")]
+    for k, v in o.items():
+        nv = n.get(k)
+        if nv is None or any(v[i] != nv[i] for i in keep):
+            problems.append(f"raw_entry {k}이 바뀌거나 사라졌습니다")
+        elif v[1 + c.index("body")] != nv[1 + c.index("body")] and nv[1 + c.index("redacted_at")] is None:
+            problems.append(f"raw_entry {k}의 원문이 바뀌었습니다")
+    o = {r[0]: r[1] for r in old.execute("SELECT id, ref FROM idea")}
+    n = {r[0]: r[1] for r in new.execute("SELECT id, ref FROM idea")}
+    for k, v in o.items():
+        if n.get(k) != v:
+            problems.append(f"글감 {v}가 사라지거나 번호가 바뀌었습니다")
+    co, cn = counts(old), counts(new)
+    max_old = old.execute("SELECT COALESCE(MAX(id),0) FROM action_log").fetchone()[0]
+    added = [{"id": r[0], "action": r[1], "target": r[2], "created_at": r[3]}
+             for r in new.execute("SELECT id, action, target, created_at FROM action_log "
+                                  "WHERE id > ? ORDER BY id", (max_old,))]
+    return {"descendant": not problems, "problems": problems[:50],
+            "delta": {"counts": {t: {"before": co[t], "after": cn[t]} for t in co if co[t] != cn[t]},
+                      "new_actions": added[:100], "new_action_count": len(added)}}
+
+
+def _rollback_context(args) -> dict:
+    res = resolve_root(use_env=False)
+    if res["problem"]:
+        raise ClioError(res["problem"]["code"], res["problem"]["message"])
+    current = _abs(res["path"])
+    journals = load_journals([current])
+    cands = [j for j in journals if j.data.get("kind") == "migrate" and j.data.get("state") == "done"
+             and _abs(j.data["target"]["root"]) == current]
+    if args.id:
+        cands = [j for j in cands if j.data["id"] == args.id]
+    if not cands:
+        raise ClioError("nothing_to_rollback",
+                        f"{current}로 옮긴 완료 기록이 없습니다. 되돌릴 이전이 없습니다.")
+    j = cands[-1]
+    source = Path(j.data["source"]["root"])
+    sst = root_state(source)
+    kept = Path(j.data["retire"]["kept_db"])
+    if not (sst["retired"] and (sst["marker"] or {}).get("relocation_id") == j.data["id"]):
+        raise ClioError("rollback_unsafe",
+                        f"옛 위치 {source}의 상태가 이전 기록과 다릅니다. 수동 확인이 필요합니다.")
+    if not kept.exists():
+        raise ClioError("rollback_unsafe", f"보존한 옛 DB가 없습니다: {kept}")
+    return {"journal": j, "current": current, "source": source, "kept": kept}
+
+
+def _copy_db_for_read(db: Path) -> tuple[sqlite3.Connection, Path]:
+    tmp = Path(tempfile.mkdtemp(prefix="clio-rb-"))
+    shutil.copy2(db, tmp / DB_NAME)
+    if Path(f"{db}-wal").exists():
+        shutil.copy2(f"{db}-wal", tmp / f"{DB_NAME}-wal")
+    return open_db(tmp / DB_NAME), tmp
+
+
+def _analyze(ctx, live: bool) -> dict:
+    """전환 후 새 위치에 쓰기가 있었는지, 있었다면 옛 DB의 후속인지 판정한다."""
+    j, current, kept = ctx["journal"], ctx["current"], ctx["kept"]
+    tmps = []
+    if live:
+        tconn, kconn = open_db(current / DB_NAME), open_db(kept)
+    else:
+        tconn, t1 = _copy_db_for_read(current / DB_NAME)
+        kconn, t2 = _copy_db_for_read(kept)
+        tmps = [t1, t2]
+    try:
+        fp_now = fingerprint(tconn)
+        integ = run_integrity(tconn, current)
+        fp_kept = fingerprint(kconn)
+        att_now = {k: v["sha256"] for k, v in
+                   hash_tree(current / "attachments", {".incoming"}).items()}
+        changed = {"db": fp_now["sha256"] != j.data["fingerprint"]["fixed"]["sha256"],
+                   "config": _cfg_sha(current) != j.data.get("staged_config_sha256"),
+                   "attachments": att_now != j.data.get("staged_attachments", {})}
+        writes = any(changed.values())
+        desc = descendant_check(kconn, tconn) if writes else None
+    finally:
+        tconn.close()
+        kconn.close()
+        for t in tmps:
+            shutil.rmtree(t, ignore_errors=True)
+    return {"writes_after_switch": writes, "changed": changed, "fp_now": fp_now,
+            "integrity": integ,
+            "kept_matches_original": fp_kept["sha256"] == j.data["fingerprint"]["source"]["sha256"],
+            "descendant": desc, "attachments_now": att_now}
+
+
+def _move_aside(p: Path, rbid: str) -> None:
+    if p.exists():
+        os.replace(p, p.with_name(f".{p.name}.pre-rollback-{rbid}"))
+
+
+def _redacted_attachments(conn, current: Path) -> list[str]:
+    """새 위치에서 영구 삭제(redact)된 첨부의 데이터 폴더 기준 상대경로."""
+    out = []
+    for r in conn.execute("SELECT stored_path FROM attachment WHERE redacted_at IS NOT NULL"):
+        sp = r["stored_path"]
+        if not sp:
+            continue
+        if os.path.isabs(sp):
+            if not _under(Path(sp), current):
+                continue
+            sp = Path(sp).relative_to(current).as_posix()
+        out.append(sp)
+    return sorted(set(out))
+
+
+def _rb_restore_db(rb: Journal, ctx: dict, an: dict) -> None:
+    """1단계: 옛 위치에 되살릴 DB·설정을 임시 이름으로 준비한다.
+
+    옛 위치의 ideas.db(차단 파일)는 아직 그대로다. 여기서 멈추거나 포기해도 구버전 도구가
+    옛 위치에서 낡은 DB를 열 수 없다. 실제 교체는 _rb_activate_source가 한다.
+    """
+    source, current, kept = ctx["source"], ctx["current"], ctx["kept"]
+    rbid, mode = rb.data["id"], rb.data["mode"]
+    tconn = open_db(current / DB_NAME)
+    tconn.execute("PRAGMA busy_timeout=5000")
+    staged_config = None
+    redacted: list[str] = []
+    try:
+        if mode == "no_writes":
+            # 보존한 옛 DB는 그대로 두고 사본으로 되살린다 (보존본을 소모하지 않는다)
+            stage = source / f".{DB_NAME}.restore-{rbid}"
+            kc = open_db(kept)
+            try:
+                snapshot(kc, stage)
+            finally:
+                kc.close()
+            expect = ctx["journal"].data["fingerprint"]["source"]["sha256"]
+        else:
+            stage = source / f".{DB_NAME}.rollback-{rbid}"
+            snapshot(tconn, stage)
+            expect = an["fp_now"]["sha256"]
+            added = []
+            for rel, sha in an["attachments_now"].items():
+                dst = source / "attachments" / rel
+                if dst.exists():
+                    if sha256_file(dst) != sha:
+                        raise ClioError("rollback_conflict", f"같은 이름의 다른 첨부가 있습니다: {rel}")
+                    continue
+                copy_file_verified(current / "attachments" / rel, dst)
+                added.append(rel)
+            if _cfg_sha(current) and _cfg_sha(current) != _cfg_sha(source):
+                tmpc = source / f".config.json.rollback-{rbid}"
+                copy_file_verified(current / "config.json", tmpc)
+                apply_config_fixups(tmpc, config_fixups(tmpc, current, source))
+                staged_config = str(tmpc)
+            # 전환 뒤 영구 삭제한 첨부는 옛 위치에서도 지운다 (복구로 되살아나지 않게)
+            redacted = [rel for rel in _redacted_attachments(tconn, current)
+                        if (source / rel).is_file()]
+            rb.update(copied_attachments=added)
+        if _fp_of(stage) != expect:
+            raise ClioError("verify_failed", "옛 위치로 되살릴 사본의 지문이 예상과 다릅니다.")
+        if fingerprint(tconn)["sha256"] != an["fp_now"]["sha256"]:
+            raise ClioError("source_changed", "복구하는 동안 새 위치가 바뀌었습니다. 다시 실행하세요.")
+        checkpoint_truncate(tconn)
+    finally:
+        tconn.close()
+    rb.phase("db_restored", staged_db=str(stage), staged_config=staged_config,
+             redacted_attachments=redacted, expect_fingerprint=expect,
+             current_fingerprint=an["fp_now"]["sha256"],
+             current_config_sha256=_cfg_sha(current))
+    crash_point("rb_after_db_restored")
+
+
+def _rb_discard_staged(rb: Journal) -> None:
+    """준비만 하고 쓰지 않은 임시 DB·설정을 지운다 (사본이므로 지워도 잃는 것이 없다)."""
+    source, rbid = Path(rb.data["target"]["root"]), rb.data["id"]
+    names = [f".{DB_NAME}.rollback-{rbid}", f".{DB_NAME}.restore-{rbid}",
+             f".config.json.rollback-{rbid}"]
+    for name in names:
+        for suf in ("", "-wal", "-shm", "-journal"):
+            (source / f"{name}{suf}").unlink(missing_ok=True)
+
+
+def _rb_retire_current(rb: Journal) -> None:
+    """2단계: 새 위치를 은퇴시킨다. 여기서 멈추면 양쪽 다 쓰기가 막힌다 (갈라지지 않음)."""
+    source, current = Path(rb.data["target"]["root"]), Path(rb.data["source"]["root"])
+    rbid = rb.data["id"]
+    if rb.data["mode"] == "no_writes":
+        aside = current.parent / f".{current.name}.rolledback-{rbid}"
+        if not aside.exists() and current.exists():
+            os.rename(current, aside)
+        m = read_marker(aside) or {}
+        m.update(state="retired", moved_to=str(source), retired_at=utc_now(), relocation_id=rbid)
+        write_marker(aside, m)
+        # 준비해 둔 빈 폴더는 되살리되, 은퇴 표시를 둔다. CLIO_DATA_DIR로 이곳을 지정한 실행이
+        # 빈 DB를 새로 만들어 옛 위치와 갈라지지 않게 한다 (다음 이전은 이 자리를 빈 폴더로 본다).
+        current.mkdir(mode=0o700, exist_ok=True)
+        if read_marker(current) is None:
+            write_marker(current, new_marker("rollback:placeholder", state="retired",
+                                             placeholder=True, moved_to=str(source),
+                                             relocation_id=rbid, retired_at=utc_now()))
+        rb.phase("current_retired", set_aside=str(aside))
+    else:
+        rb.phase("current_retired", retire=retire_root(current, rbid, source))
+    crash_point("rb_after_current_retired")
+
+
+def _rb_activate_source(rb: Journal) -> None:
+    """3단계: 옛 위치에 준비한 DB·설정을 넣고 정본으로 표시한다 (멱등).
+
+    새 위치는 이미 은퇴했으므로 이 단계 전에는 양쪽 다 쓰기가 막혀 있다.
+    """
+    source, current = Path(rb.data["target"]["root"]), Path(rb.data["source"]["root"])
+    rbid = rb.data["id"]
+    db = source / DB_NAME
+    expect = rb.data["expect_fingerprint"]
+    stage = Path(rb.data["staged_db"]) if rb.data.get("staged_db") else None
+    if stage is not None and stage.exists():
+        if _fp_of(stage) != expect:
+            raise ClioError("verify_failed", "옛 위치로 되살릴 사본의 지문이 예상과 다릅니다.")
+        for suf in ("-wal", "-shm"):
+            _move_aside(source / f"{DB_NAME}{suf}", rbid)
+        os.replace(stage, db)
+    elif db_kind(db) != "sqlite" or _fp_of(db) != expect:
+        raise ClioError("rollback_conflict", f"옛 위치에 되살릴 DB를 찾지 못했습니다: {db}. "
+                        "수동 확인이 필요합니다 (새 위치 백업: "
+                        f"{(rb.data.get('backup') or {}).get('dir')}).")
+    sc = rb.data.get("staged_config")
+    if sc and Path(sc).exists():
+        keep = source / f"config.json.pre-rollback-{rbid}"
+        if (source / "config.json").exists() and not keep.exists():
+            shutil.copy2(source / "config.json", keep)
+        os.replace(sc, source / "config.json")
+    removed = []
+    for rel in rb.data.get("redacted_attachments") or []:
+        f = source / rel
+        if f.is_file():
+            f.unlink()
+            removed.append(rel)
+    m = read_marker(source) or new_marker("rollback")
+    m.update(state="active", relocation_id=rbid, restored_at=utc_now(),
+             relocated_from={"path": str(current), "root_id": rb.data.get("current_root_id")})
+    for k in ("moved_to", "retired_at", "retired_db"):
+        m.pop(k, None)
+    write_marker(source, m)
+    rb.phase("source_activated", source_root_id=m["root_id"],
+             config=(f"새 위치의 설정을 가져왔다. 옛 설정은 config.json.pre-rollback-{rbid}"
+                     if sc else None),
+             removed_redacted_attachments=sorted(set(removed) | set(
+                 rb.data.get("removed_redacted_attachments") or [])))
+
+
+def _rb_finish(args, rb: Journal) -> dict:
+    source, current = Path(rb.data["target"]["root"]), Path(rb.data["source"]["root"])
+    rbid = rb.data["id"]
+    write_pointer(source, rb.data.get("source_root_id"), "rollback", rbid)
+    rb.phase("pointer_set")
+    invalidate_resolution()
+    res = resolve_root(use_env=False)
+    c = open_db(source / DB_NAME)
+    try:
+        fp_after = fingerprint(c)["sha256"]
+        integ = run_integrity(c, source)
+    finally:
+        c.close()
+    post = {"where": str(res["path"]), "matches_source": _abs(res["path"]) == source,
+            "fingerprint_matches_expected": fp_after == rb.data["expect_fingerprint"],
+            "integrity_check": integ["integrity_check"], "healthy": integ["healthy"],
+            "current_blocked": not root_state(current)["live"],
+            "redacted_attachments_absent": not any(
+                (source / rel).exists() for rel in rb.data.get("redacted_attachments") or [])}
+    if not (post["matches_source"] and post["fingerprint_matches_expected"]
+            and post["current_blocked"] and post["redacted_attachments_absent"]):
+        rb.update(post_verification=post)
+        raise ClioError("post_verify_failed", "복구 후 검증에 실패했습니다.", post_verification=post)
+    cut = {"state": "rolled_back", "relocation_id": rbid, "rolled_back": rb.data["rolls_back"],
+           "from": str(current), "to": str(source), "at": utc_now(),
+           "backup": (rb.data.get("backup") or {}).get("dir"), "verified": True,
+           "post_switch_writes": rb.data["mode"] == "with_writes", "clio_version": CLIO_VERSION}
+    if args.no_registry or rb.data.get("no_registry"):
+        reg = {"updated": False, "reason": "skipped_by_option",
+               "deliver_to_chris": {"operational_roots.ideas": str(source), "cutovers.ideas": cut}}
+    else:
+        reg = update_registry(Path(rb.data["registry"]), str(source), cut)
+    rb.phase("registry_done", registry_update=reg, post_verification=post)
+    rb.finish("done")
+    for mj in load_journals([source, current]):
+        if mj.data["id"] == rb.data["rolls_back"] and mj.data.get("state") == "done":
+            mj.finish("rolled_back", rolled_back_by=rbid)
+    mode = rb.data["mode"]
+    return {"rolled_back": True, "mode": mode, "relocation_id": rbid,
+            "rolled_back_relocation": rb.data["rolls_back"], "data_dir": str(source),
+            "backup": (rb.data.get("backup") or {}).get("dir"), "delta": rb.data.get("delta"),
+            "copied_attachments": rb.data.get("copied_attachments"),
+            "removed_redacted_attachments": rb.data.get("removed_redacted_attachments"),
+            "config": rb.data.get("config"),
+            "post_verification": post, "registry_update": reg, "journal": str(rb.path),
+            "message": "옛 위치로 되돌렸습니다. " + (
+                "전환 후 새 기록이 없어, 보존한 옛 DB를 검증해 되살렸습니다 (보존본은 그대로 둠)."
+                if mode == "no_writes" else
+                "전환 후 생긴 새 기록까지 함께 옮겼습니다. 새 위치는 차단해 두었습니다.")}
+
+
+RB_ORDER = ["planned", "locked", "backup_done", "db_restored", "current_retired",
+            "source_activated", "pointer_set", "registry_done"]
+
+
+def resume_rollback(args, cfg, rb: Journal):
+    """멈춘 복구를 이어간다. 처음부터 해야 하면 정리하고 None을 돌려준다."""
+    source, current = Path(rb.data["target"]["root"]), Path(rb.data["source"]["root"])
+    rbid = rb.data["id"]
+    phase = rb.data.get("phase")
+    locks = []
+    try:
+        for root in sorted({source, current}, key=str):
+            if root.exists():
+                locks.append(lock_root(root, exclusive=True, timeout=args.lock_wait))
+        if RB_ORDER.index(phase) < RB_ORDER.index("db_restored"):
+            _rb_discard_staged(rb)
+            rb.finish("abandoned", note="복구 전 단계에서 멈췄다. 바뀐 것이 없어 처음부터 다시 한다.")
+            return None
+        if phase == "db_restored":
+            if root_state(current)["live"] and (
+                    _fp_of(current / DB_NAME) != rb.data["current_fingerprint"]
+                    or _cfg_sha(current) != rb.data.get("current_config_sha256",
+                                                        _cfg_sha(current))):
+                _rb_discard_staged(rb)
+                rb.finish("abandoned", note="멈춘 사이 새 위치에 기록(또는 설정 변경)이 더 생겼다. "
+                                            "옛 위치는 차단 상태 그대로이며, 처음부터 다시 한다.")
+                return None
+            ensure_quiet(current, 0)
+            _rb_retire_current(rb)
+            phase = "current_retired"
+        if phase == "current_retired":
+            _rb_activate_source(rb)
+        out = _rb_finish(args, rb)
+        out["resumed"] = True
+        return out
+    finally:
+        for fd in locks:
+            try:
+                unlock_root(fd)
+            except OSError:
+                pass
+
+
+def cmd_rollback(args, cfg):
+    pending = [j for j in load_journals([]) if j.data.get("kind") == "rollback"
+               and j.data.get("state") == "running"]
+    if pending and args.dry_run:
+        return {"dry_run": True, "pending_rollback": _brief(pending[-1]),
+                "message": "멈춘 복구가 있습니다. rollback을 다시 실행하면 이어서 처리합니다."}
+    if pending:
+        out = resume_rollback(args, cfg, pending[-1])
+        if out is not None:
+            return out
+    ctx = _rollback_context(args)
+    j, current, source, kept = ctx["journal"], ctx["current"], ctx["source"], ctx["kept"]
+    an = _analyze(ctx, live=False)
+    mode = "with_writes" if an["writes_after_switch"] else "no_writes"
+    blockers = []
+    if not an["kept_matches_original"]:
+        blockers.append("보존한 옛 DB의 지문이 이전 당시와 다릅니다.")
+    if mode == "with_writes":
+        if not an["descendant"]["descendant"]:
+            blockers.append("새 위치의 데이터가 옛 DB에 이어 쓴 결과가 아닙니다: "
+                            + "; ".join(an["descendant"]["problems"][:5]))
+        if not an["integrity"]["healthy"] and not args.accept_source_problems:
+            blockers.append("새 위치에 무결성 문제가 있습니다 "
+                            "(--accept-source-problems로 그대로 옮길 수 있음).")
+    preview = {
+        "mode": mode, "relocation_id": j.data["id"], "current": str(current),
+        "restore_to": str(source), "kept_db": str(kept),
+        "kept_matches_original": an["kept_matches_original"],
+        "changed_since_switch": an["changed"],
+        "descendant": (an["descendant"] or {}).get("descendant"),
+        "delta": (an["descendant"] or {}).get("delta"),
+        "current_healthy": an["integrity"]["healthy"], "blockers": blockers,
+        "steps": (["새 위치를 백업", "보존한 옛 DB를 검증해 사본으로 되살림 (보존본은 그대로)",
+                   "새 위치 사본은 옆으로 옮겨 보존", "옛 위치를 정본으로 표시",
+                   "위치 기록·registry를 옛 위치로"] if mode == "no_writes" else
+                  ["새 위치를 먼저 백업 (새 기록 보존)", "새 기록이 옛 DB의 후속인지 검증",
+                   "최신 DB·새 첨부·설정을 옛 위치로 복사·검증", "새 위치를 차단 파일로 은퇴",
+                   "옛 위치를 정본으로 표시", "위치 기록·registry를 옛 위치로"]),
+    }
+    if args.dry_run:
+        return {"dry_run": True, **preview}
+    if blockers:
+        raise ClioError("rollback_refused", "복구 사전 점검을 통과하지 못해 아무것도 바꾸지 않았습니다.",
+                        **preview)
+
+    locks = []
+    rb = None
+    try:
+        for root in sorted({current, source}, key=str):
+            locks.append(lock_root(root, exclusive=True, timeout=args.lock_wait))
+        ensure_quiet(current, args.quiet_seconds)
+        an = _analyze(ctx, live=True)          # 잠금 안에서 다시 판정
+        mode = "with_writes" if an["writes_after_switch"] else "no_writes"
+        if mode == "with_writes" and not an["descendant"]["descendant"]:
+            raise ClioError("rollback_refused", "새 위치 데이터가 옛 DB의 후속이 아닙니다.",
+                            problems=an["descendant"]["problems"])
+        rbid = new_id(cfg, source, current)
+        tmarker = read_marker(current) or {}
+        rb = Journal.create(source, {
+            "format": 1, "id": rbid, "kind": "rollback", "system": "ideas", "state": "running",
+            "clio_version": CLIO_VERSION, "started_at": utc_now(), "rolls_back": j.data["id"],
+            "mode": mode, "source": {"root": str(current)}, "target": {"root": str(source)},
+            "current_root_id": tmarker.get("root_id"),
+            "registry": str(_abs(args.registry) if args.registry else registry_path()),
+            "no_registry": args.no_registry,
+            "changed_since_switch": an["changed"],
+            "delta": (an["descendant"] or {}).get("delta"),
+        })
+        rb.phase("locked")
+        backup_root = _abs(args.backup_root or cfg["backup_root"])
+        tconn = open_db(current / DB_NAME)
+        try:
+            bk = create_backup(tconn, current, backup_root, cfg, kind="rollback",
+                               relocation_id=rbid, root_id=tmarker.get("root_id"))
+        finally:
+            tconn.close()
+        if not bk["verified"] or bk["fingerprint"] != an["fp_now"]["sha256"]:
+            raise ClioError("backup_unverified", "새 위치 백업을 검증하지 못해 중단합니다.",
+                            backup=bk["path"])
+        rb.phase("backup_done", backup={"dir": bk["path"], "fingerprint": bk["fingerprint"]})
+        crash_point("rb_after_backup")
+        _rb_restore_db(rb, ctx, an)
+        _rb_retire_current(rb)
+        _rb_activate_source(rb)
+        return _rb_finish(args, rb)
+    except BaseException as e:
+        if rb is not None and rb.data.get("state") == "running":
+            err = {"code": getattr(e, "code", type(e).__name__), "message": str(e)}
+            if RB_ORDER.index(rb.data["phase"]) < RB_ORDER.index("db_restored"):
+                _rb_discard_staged(rb)
+                rb.finish("failed", error=err, note="복구 전에 실패했다. 아무것도 바뀌지 않았다.")
+            else:
+                rb.update(error=err)
+                if isinstance(e, ClioError):
+                    e.extra["next"] = "idea_relocate rollback 을 다시 실행하면 이어서 처리합니다."
+        raise
+    finally:
+        for fd in locks:
+            try:
+                unlock_root(fd)
+            except OSError:
+                pass
+
+
+# --------------------------------------------------------------------------
+# CLI
+# --------------------------------------------------------------------------
+
+def build_parser():
+    p = argparse.ArgumentParser(prog="idea_relocate", description="Clio 데이터 위치 이전·복구")
+    sub = p.add_subparsers(dest="cmd")
+
+    def common(sp):
+        sp.add_argument("--from", dest="from_", help="원본 데이터 폴더 (기본: 현재 정본)")
+        sp.add_argument("--to", help="대상 폴더 (기본: ~/SecretaryData/services/ideas)")
+        sp.add_argument("--backup-root", help="백업 루트 (기본: config의 backup_root)")
+        sp.add_argument("--registry", help="공동 registry 경로 (기본: ~/SecretaryData/registry.json)")
+        sp.add_argument("--no-registry", action="store_true",
+                        help="registry를 고치지 않고 갱신 내용만 출력 (Chris에게 전달)")
+        sp.add_argument("--quiet-seconds", type=float, default=60.0,
+                        help="이 시간 안에 쓰기가 있었으면 전환하지 않는다 (기본 60초)")
+        sp.add_argument("--min-free-bytes", type=int, default=MIN_FREE_DEFAULT,
+                        help="이전 후에도 남겨 둘 최소 여유 공간")
+        sp.add_argument("--accept-source-problems", action="store_true",
+                        help="원본에 이미 있는 무결성 문제를 그대로 옮긴다 (같은 문제만 허용)")
+        sp.add_argument("--replace-retired", action="store_true",
+                        help="대상이 예전에 은퇴한 위치면 옆으로 옮겨 보존하고 새로 채운다")
+        sp.add_argument("--allow-old-tools", action="store_true",
+                        help="설치된 도구가 구버전이어도 진행 (전환 후 그 도구는 실패한다)")
+        sp.add_argument("--lock-wait", type=float, default=5.0,
+                        help="실행 중인 Clio 명령이 끝나기를 기다릴 초")
+        sp.add_argument("--scan", action="append", help="옛 경로 참조를 찾을 추가 파일·폴더")
+        sp.add_argument("--no-scan", action="store_true", help="사용자 파일·예약 작업 조사 생략")
+
+    pl = sub.add_parser("plan", help="dry-run: 실제 경로·입력·쓰기 주체·중단 범위·복구 방법 (쓰기 없음)")
+    common(pl)
+    pl.set_defaults(fn=cmd_plan)
+    r = sub.add_parser("run", help="이전 실행 (중단됐으면 이어서)")
+    common(r)
+    r.set_defaults(fn=cmd_run)
+    s = sub.add_parser("status", help="현재 위치·이전 기록·전환 후 새 기록 여부")
+    s.add_argument("--from", dest="from_")
+    s.add_argument("--registry")
+    s.set_defaults(fn=cmd_status)
+    b = sub.add_parser("rollback", help="옛 위치로 복구 (전환 후 새 기록 보존)")
+    b.add_argument("--id", help="되돌릴 이전 id (기본: 가장 최근)")
+    b.add_argument("--dry-run", action="store_true", help="무엇을 할지만 보여준다")
+    b.add_argument("--backup-root")
+    b.add_argument("--registry")
+    b.add_argument("--no-registry", action="store_true")
+    b.add_argument("--quiet-seconds", type=float, default=60.0)
+    b.add_argument("--lock-wait", type=float, default=5.0)
+    b.add_argument("--accept-source-problems", action="store_true")
+    b.set_defaults(fn=cmd_rollback)
+    return p
+
+
+if __name__ == "__main__":
+    run_cli(build_parser, lambda args, cfg: args.fn(args, cfg))

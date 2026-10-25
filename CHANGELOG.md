@@ -14,6 +14,54 @@
 
 데이터 파일 형식의 버전(`SCHEMA_VERSION`)은 별도로 관리한다. 현재 `1`.
 
+## [1.3.0] — 2026-10-25
+
+### 추가
+
+- **공통 데이터 위치.** 신규 설치는 `~/SecretaryData/services/ideas/`를 쓴다. 위치 판정 순서는
+  `CLIO_DATA_DIR` → 위치 기록(`~/.config/clio-idea-manager/data-root.json`) → 기존 `~/ClioData`
+  (DB가 있을 때) → 새 기본 위치. 환경 변수 없이 도는 에이전트·예약 작업도 위치 기록을 따른다.
+- 데이터 폴더의 위치 표시 `clio-root.json`(`root_id`, `active`/`retired`, 이전 출처·행선지).
+- `idea_check where` — 지금 쓰는 위치와 판정 근거, 두 후보 상태, 경고 (쓰기 없음).
+- `idea_check init --pin --expect-root` — 판정한 위치를 위치 기록에 고정 (`install.sh`가 사용).
+- `idea_relocate` — 데이터 폴더 이전·복구.
+  - `plan`: 실제 경로·건수·백업 위치·쓰기 주체(잠금·열린 파일·최근 쓰기·구버전 도구 사본)·
+    예약 작업과 셸 설정의 옛 경로 참조(경로·줄 번호만)·DB 안 절대경로·여유 공간·권한·
+    예상 중단 시간·복구 방법. 아무것도 바꾸지 않는다.
+  - `run`: 배타 잠금 → 검증된 새 백업 → 임시 폴더에 스냅샷·첨부·설정 복사(해시 검증) →
+    표별 지문·무결성·파일 목록 대조 → 전환(옛 DB는 `ideas.db.relocated-<id>`로 보존하고 그 자리에
+    차단 파일) → 위치 기록 → registry의 `ideas` 항목만 잠금 갱신. 단계별 기록으로 중단 후 재실행.
+  - `status`: 현재 위치, 이전 기록, 옛 위치 차단 여부, 전환 뒤 새 기록, 끝나지 않은 작업.
+  - `rollback`: 전환 뒤 새 기록이 없으면 보존본을 사본으로 되살리고(새 위치에는 은퇴 표시만
+    남긴다), 있으면 새 위치를 먼저 백업하고 후속 관계를 검증한 뒤 최신 데이터·새 첨부를 옛 위치로
+    옮긴다(전환 뒤 영구 삭제한 첨부는 되살리지 않는다). 옛 위치의 차단 파일은 마지막 단계에서만
+    바꾸므로 멈춰도 두 위치가 동시에 쓰이지 않는다. 중단 후 재실행.
+  - 설정값은 `/`·`~/`로 시작하고 원본 폴더 안을 가리키는 것만 새 위치로 바꾼다.
+- 모든 Clio 명령이 데이터 폴더에 공유 잠금(`.clio.lock`)을 잡는다. 이전·복구 중에는
+  `CLIO_LOCK_TIMEOUT`(기본 30초)까지 기다렸다가 `root_busy`로 실패한다.
+- 백업 검증 목록 `manifest.json`(형식 2: 도구·종류·표별 지문·파일별 SHA-256)과 즉시 검증.
+  `restore-test`가 목록 대조 후 격리 복원하며 `--restore-to`로 사본을 남길 수 있다.
+- 설정 키 `backup_root`(기본 `~/SecretaryBackups/ideas`).
+- 예상하지 못한 오류도 traceback 대신 JSON 실패(`internal_error`)로 알린다.
+- 테스트 37건 추가 (`tests/test_relocation.py`, 총 67건).
+
+### 변경
+
+- 백업 위치가 데이터 폴더 안(`backups/`)에서 `backup_root`로 바뀌었다. 기존 백업은 그대로 둔다.
+- 백업에 `config.json`도 넣고, 백업 DB는 파일 하나로 완결(저널 모드 DELETE)한다.
+- `restore-test`는 백업 폴더의 DB를 열지 않고 복사본으로 검증한다 (백업 폴더를 바꾸지 않는다).
+- `backup_mirror`는 그 폴더가 **이미 있을 때만** 복사한다. 설정만으로 미러 폴더를 새로 만들지 않는다.
+- 백업 정리는 이 도구의 일상 백업만 대상으로 한다. 이전·복구 백업과 다른 도구의 백업은 지우지 않는다.
+- `install.sh`는 위치를 먼저 판정하고, 판정할 수 없으면 아무것도 바꾸지 않고 멈춘다.
+  기존 설치는 그 위치를 그대로 쓰며 데이터를 옮기지 않는다.
+- 무결성 검사의 첨부 경로를 데이터 폴더 기준으로 해석한다.
+
+### 수정
+
+- 데이터 폴더가 없을 때(외장 디스크 분리, 잘못된 경로 등) 쓰기 명령이 그 자리에 빈 DB를 새로
+  만들고 저장하던 문제. 위치 기록·위치 표시가 있는데 DB가 없으면 `root_missing`·`db_missing`으로,
+  두 위치 모두에 DB가 있으면 `root_ambiguous`로 멈춘다.
+
 ## [1.2.2] — 2026-08-19
 
 ### 수정
@@ -98,6 +146,7 @@
 - 온라인 스냅샷 백업(일 7/주 4/월 12), redaction manifest, 복구 시험.
 - 저장 계층 테스트 26건.
 
+[1.3.0]: https://github.com/pilwonhur/clio-idea-manager/releases/tag/v1.3.0
 [1.2.2]: https://github.com/pilwonhur/clio-idea-manager/releases/tag/v1.2.2
 [1.2.1]: https://github.com/pilwonhur/clio-idea-manager/releases/tag/v1.2.1
 [1.2.0]: https://github.com/pilwonhur/clio-idea-manager/releases/tag/v1.2.0

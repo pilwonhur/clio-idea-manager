@@ -6,11 +6,11 @@ Discord·Telegram·WhatsApp 같은 메신저로 던진 한 문장이 대화 로�
 지시어 하나로 원문을 그대로 데이터베이스에 커밋하고, 그 뒤에 분류·정제·연결을 이어붙인다.
 판단은 LLM이 하고 저장은 결정론적 CLI 도구가 한다. 외부 의존성은 없다.
 
-[![version](https://img.shields.io/badge/version-1.2.2-informational)](CHANGELOG.md)
+[![version](https://img.shields.io/badge/version-1.3.0-informational)](CHANGELOG.md)
 [![Python](https://img.shields.io/badge/python-3.11%2B-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![dependencies](https://img.shields.io/badge/dependencies-none-success)](#요구사항)
 [![storage](https://img.shields.io/badge/storage-SQLite%20%2B%20FTS5-003B57?logo=sqlite&logoColor=white)](#8-데이터-모델)
-[![tests](https://img.shields.io/badge/tests-30%20passing-brightgreen)](#15-테스트)
+[![tests](https://img.shields.io/badge/tests-67%20passing-brightgreen)](#15-테스트)
 [![license](https://img.shields.io/badge/license-MIT-blue)](#20-라이선스)
 
 > Claude Code / Claude Agent Skill 형식으로 배포된다. 스킬을 설치하지 않고
@@ -195,26 +195,31 @@ cd clio-idea-manager
 
 `install.sh`는 다음을 수행한다.
 
+0. 데이터 폴더를 판정한다 ([데이터 위치](#데이터-위치)). 판정할 수 없으면 **아무것도 바꾸지 않고** 멈춘다.
 1. 스킬 코드를 `~/.claude/skills/clio-idea-manager/`에 넣고 실행 권한을 준다.
-2. 데이터 디렉터리 `~/ClioData/`를 만들고 `config.json`을 준비한다.
-3. 스키마를 생성(`idea_check init`, 멱등)하고 무결성 검사를 돌려 결과를 출력한다.
+2. 스키마를 생성(`idea_check init`, 멱등)하고, 판정한 위치를 위치 기록
+   `~/.config/clio-idea-manager/data-root.json`에 고정한 뒤 `config.json`을 준비한다.
+3. 무결성 검사를 돌려 결과를 출력한다.
+
+신규 설치는 공통 비서 데이터 위치 `~/SecretaryData/services/ideas/`를 쓴다.
 
 ```
-== Clio 스킬 설치: 1.2.2 ==
+== Clio 스킬 설치: 1.3.0 ==
 스킬  : /Users/you/.claude/skills/clio-idea-manager
-데이터: /Users/you/ClioData  (ideas.db·첨부·백업은 건드리지 않음)
+데이터: /Users/you/SecretaryData/services/ideas  (새 기본 위치 · ideas.db·첨부·백업은 옮기거나 지우지 않음)
 
-파일: 추가 12 · 갱신 0 · 유지 0 · 삭제 0
-config.json 생성 (자동 연결은 초기 비활성 — PRD D1)
+파일: 추가 15 · 갱신 0 · 유지 0 · 삭제 0
 데이터베이스를 새로 만들었습니다. (스키마 v1)
+위치 기록 고정: /Users/you/.config/clio-idea-manager/data-root.json (install:new)
+config.json 생성 (자동 연결은 초기 비활성 — PRD D1)
 무결성: 이상 없음
 
-설치 완료 — clio-idea-manager 1.2.2
-데이터베이스: /Users/you/ClioData/ideas.db
+설치 완료 — clio-idea-manager 1.3.0
+데이터베이스: /Users/you/SecretaryData/services/ideas/ideas.db
 ```
 
 **스킬 코드와 데이터는 물리적으로 분리되어 있다.** 스킬을 몇 번을 다시 설치하거나
-업데이트해도 `~/ClioData/`는 건드리지 않는다.
+업데이트해도 데이터 폴더는 옮기거나 지우지 않는다.
 
 ### 업데이트
 
@@ -236,18 +241,25 @@ cd ~/Downloads/clio-idea-manager-new
 
 실행하면 무엇이 바뀌었는지 건수로 보고한다.
 
-```
-== Clio 스킬 업데이트: 1.2.1 → 1.2.2 ==
-스킬  : /Users/you/.claude/skills/clio-idea-manager
-데이터: /Users/you/ClioData  (ideas.db·첨부·백업은 건드리지 않음)
+v1.2 이하에서 올리면 기존 `~/ClioData`를 **그대로 쓴다** (새 위치에 빈 DB를 만들지 않는다).
+옮기는 것은 별도 명령이다 ([데이터 폴더 옮기기](#데이터-폴더-옮기기)).
 
-이전 버전 보관: /Users/you/ClioData/skill-prev
-파일: 추가 0 · 갱신 3 · 유지 9 · 삭제 0
-config.json 유지 (변경 없음)
+```
+== Clio 스킬 업데이트: 1.2.2 → 1.3.0 ==
+스킬  : /Users/you/.claude/skills/clio-idea-manager
+데이터: /Users/you/ClioData  (기존 설치 위치 유지 · ideas.db·첨부·백업은 옮기거나 지우지 않음)
+
+이전 버전 보관: /Users/you/ClioData/skill-prev  (되돌리려면 이 디렉터리를 다시 복사하면 된다)
+파일: 추가 3 · 갱신 4 · 유지 8 · 삭제 0
 기존 데이터베이스를 그대로 사용합니다. (스키마 v1)
+위치 기록 고정: /Users/you/.config/clio-idea-manager/data-root.json (install:legacy)
+config.json 유지 + 새 설정 키 추가: backup_root
 무결성: 이상 없음
 
-업데이트 완료 — clio-idea-manager 1.2.2
+업데이트 완료 — clio-idea-manager 1.3.0
+데이터베이스: /Users/you/ClioData/ideas.db
+기존 위치를 그대로 씁니다. 새 공통 위치로 옮기려면 (자동으로 옮기지 않음):
+  /Users/you/.claude/skills/clio-idea-manager/scripts/idea_relocate plan    # 미리보기, 아무것도 바꾸지 않음
 변경 내용: /Users/you/.claude/skills/clio-idea-manager/CHANGELOG.md
 ```
 
@@ -255,18 +267,19 @@ config.json 유지 (변경 없음)
 
 | 항목 | 처리 |
 |---|---|
-| `~/ClioData/ideas.db`, `attachments/`, `backups/` | **손대지 않는다** |
+| 데이터 폴더의 `ideas.db`, `attachments/`, `backups/` | **손대지 않는다** (위치도 옮기지 않는다) |
+| 데이터 위치 | 지금 쓰는 위치를 위치 기록에 고정한다. 판정이 모호하면 설치를 멈춘다 |
 | `config.json`의 사용자 수정값 | **그대로 유지한다** (임계값·경로 등) |
 | 새 버전에서 추가된 설정 키 | 기본값으로 **채워 넣는다** — 없던 키만 |
 | 바뀐 스킬 파일 | 덮어쓴다 |
 | 이전 버전에만 있던 파일 | 지운다 (낡은 스크립트가 남아 오작동하지 않도록) |
-| 직전 스킬 코드 | `~/ClioData/skill-prev/`에 한 세대 보관한다 (스킬 디렉터리 밖) |
+| 직전 스킬 코드 | `<데이터 폴더>/skill-prev/`에 한 세대 보관한다 (스킬 디렉터리 밖) |
 | 스키마 | `idea_check init`이 멱등하게 보장하고, 끝나면 무결성을 검사한다 |
 
 설치된 버전은 언제든 확인할 수 있다.
 
 ```bash
-~/.claude/skills/clio-idea-manager/scripts/idea_check --version    # clio-idea-manager 1.2.0
+~/.claude/skills/clio-idea-manager/scripts/idea_check --version    # clio-idea-manager 1.3.0
 ```
 
 변경 내용은 [`CHANGELOG.md`](CHANGELOG.md)와 [Releases](https://github.com/pilwonhur/clio-idea-manager/releases)에 있다.
@@ -274,16 +287,21 @@ config.json 유지 (변경 없음)
 ### 업데이트를 되돌리기
 
 새 버전이 이상하면 직전 스킬 코드로 되돌린다. **데이터는 관여하지 않으므로 그대로 남는다.**
+`<데이터 폴더>`는 `idea_check where`의 `data_dir`이다 (v1.2 이하에서 올렸다면 `~/ClioData`).
 
 ```bash
 rm -rf ~/.claude/skills/clio-idea-manager
-cp -R ~/ClioData/skill-prev ~/.claude/skills/clio-idea-manager
+cp -R <데이터 폴더>/skill-prev ~/.claude/skills/clio-idea-manager
 ~/.claude/skills/clio-idea-manager/scripts/idea_check --version    # 되돌아간 버전 확인
 ```
 
 > 롤백본은 **`~/.claude/skills/` 밖에** 둔다. 스킬 디렉터리 안에 사본을 두면 `SKILL.md`가
 > 딸려 있어 같은 설명의 스킬이 하나 더 등록되고, 어느 쪽이 호출될지 알 수 없게 된다.
 > 보관 위치는 `CLIO_PREV_DIR`로 바꿀 수 있다.
+
+> 코드 되돌리기와 데이터 위치 되돌리기는 별개다. 데이터 폴더를 옮긴 뒤 v1.2 이하 코드로 되돌리면
+> 구버전은 위치 기록을 모르므로 `~/ClioData`의 차단 파일에서 `file is not a database`로 멈춘다
+> (빈 DB에 조용히 쓰지 않는다). [데이터 폴더 옮기기](#데이터-폴더-옮기기) 참고.
 
 특정 버전으로 다시 설치하고 싶다면 저장소에서 그 태그를 꺼내 `install.sh`를 실행한다.
 
@@ -293,26 +311,76 @@ git checkout v1.1.0 && ./install.sh
 git checkout main               # 나중에 최신으로 복귀
 ```
 
-### 설치 경로 바꾸기
+### 데이터 위치
+
+모든 도구와 `install.sh`가 같은 순서로 정한다. 위에서부터 처음 맞는 것을 쓴다.
+
+| 순서 | 출처 | 언제 |
+|---|---|---|
+| 1 | `CLIO_DATA_DIR` 환경 변수 | 명시한 실행에만 적용 (위치 기록으로 고정하지 않는다) |
+| 2 | 위치 기록 `~/.config/clio-idea-manager/data-root.json` | 설치·이전이 쓴다. 환경 변수 없는 에이전트·예약 작업도 이것을 따른다 |
+| 3 | `~/ClioData` | 위치 기록이 없고 그곳에 DB가 있을 때 (v1.2 이하 설치) |
+| 4 | `~/SecretaryData/services/ideas` | 신규 설치 |
+
+```bash
+scripts/idea_check where    # 지금 쓰는 위치, 판정 근거, 두 후보 상태, 경고 (쓰기 없음)
+```
+
+판정할 수 없으면 **빈 DB를 새로 만들지 않고** 오류로 멈춘다 — 위치 기록 없이 두 곳 모두에 DB가 있을 때
+(`root_ambiguous`), 위치 기록이 가리키는 폴더가 없을 때(`root_missing`, 외장 디스크 분리 등),
+이전을 마친 옛 위치를 가리킬 때(`root_retired`). 자세한 표는
+[references/relocation.md](references/relocation.md) §1.
 
 | 환경 변수 | 기본값 | 의미 |
 |---|---|---|
 | `CLIO_SKILL_DIR` | `~/.claude/skills/clio-idea-manager` | 스킬 설치 위치 (설치 시점에만 사용) |
-| `CLIO_DATA_DIR` | `~/ClioData` | 데이터 위치 (**모든 CLI 실행 시 참조**) |
+| `CLIO_DATA_DIR` | (위 판정) | 데이터 위치를 이 실행에 한해 명시 |
+| `CLIO_LOCK_TIMEOUT` | `30` | 이전·복구가 잠금을 쥐고 있을 때 기다릴 초 (넘으면 `root_busy`) |
+| `CLIO_PREV_DIR` | `<데이터 폴더>/skill-prev` | 직전 스킬 코드 보관 위치 |
 
 ```bash
-CLIO_DATA_DIR=~/work/ClioData ./install.sh
-CLIO_DATA_DIR=~/work/ClioData python3 scripts/idea_search list --format text
+CLIO_DATA_DIR=~/work/clio-demo python3 scripts/idea_check init
+CLIO_DATA_DIR=~/work/clio-demo python3 scripts/idea_search list --format text
 ```
 
 `CLIO_DATA_DIR`는 격리된 실험이나 테스트용 데이터셋을 만들 때도 그대로 쓰인다.
+위치 기록과 다른 값을 주면 `where`가 `env_overrides_pointer`로 알려준다.
+
+### 데이터 폴더 옮기기
+
+v1.2 이하의 `~/ClioData`를 공통 위치 `~/SecretaryData/services/ideas`로 옮긴다. **업데이트가 자동으로
+옮기지 않는다.** 먼저 코드를 v1.3.0 이상으로 올린 뒤(`./update.sh`) 실행한다.
+
+```bash
+S=~/.claude/skills/clio-idea-manager/scripts
+$S/idea_relocate plan              # 미리보기 — 아무것도 바꾸지 않는다
+$S/idea_relocate run               # 백업 → 복사·검증 → 전환 (멈추면 같은 명령을 다시)
+$S/idea_relocate status            # 현재 위치, 이전 기록, 전환 뒤 새 기록 여부
+$S/idea_relocate rollback --dry-run
+$S/idea_relocate rollback          # 옛 위치로 되돌리기 (전환 뒤 새 기록은 함께 옮긴다)
+```
+
+- `plan`은 실제 경로, 기록 건수, 백업 위치, 실행 중인 쓰기 주체, 예약 작업·셸 설정의 옛 경로 참조
+  (경로·줄 번호만), 여유 공간·권한, 예상 중단 시간(Clio 명령만, 보통 몇 초), 복구 방법을 보여준다.
+  차단 사유(구버전 도구 설치, 실행 중인 쓰기, 원본 무결성 문제, 대상 충돌 등)가 있으면 `run`은
+  아무것도 바꾸지 않는다.
+- `run`은 새 백업(`~/SecretaryBackups/ideas/<시각>/`, 검증 목록 포함)을 먼저 만들고 검증한다.
+  SQLite 백업 API를 쓰므로 WAL에만 있는 기록도 빠지지 않는다. 표별 지문·파일 해시를 대조한 뒤
+  전환한다.
+- 옛 DB는 지우지 않고 `ideas.db.relocated-<id>`로 보존하고, 그 자리에 **차단 파일**을 둔다. 옛 경로로
+  쓰려는 도구(구버전 포함)는 저장하지 못하고 멈춘다. 옛 위치의 첨부·`skill-prev`·`backups`도 그대로 둔다.
+- 공동 registry(`~/SecretaryData/registry.json`)는 `ideas` 항목만 잠금 아래 고친다.
+- 전환 뒤 새 기록이 있으면 `rollback`은 옛 DB로 단순 복귀하지 않는다. 새 위치를 먼저 백업하고,
+  새 기록이 옛 DB의 후속인지 검증한 뒤 최신 데이터를 옛 위치로 옮긴다.
+
+전체 절차와 중단·재실행 규칙: [references/relocation.md](references/relocation.md).
 
 ### 제거
 
 ```bash
 rm -rf ~/.claude/skills/clio-idea-manager   # 스킬만 제거. 데이터는 남는다
-# 데이터까지 지우려면 (되돌릴 수 없다)
-# rm -rf ~/ClioData
+# 데이터까지 지우려면 (되돌릴 수 없다) — 먼저 idea_check where로 위치를 확인한다
+# rm -rf <데이터 폴더> ~/.config/clio-idea-manager
 ```
 
 ---
@@ -411,7 +479,7 @@ CLIO-0002 — 공통어: 기억
 **7. 내보내기와 백업**
 
 ```bash
-python3 scripts/idea_export md          # ~/ClioData/exports/markdown/ (Obsidian 열람용)
+python3 scripts/idea_export md          # <데이터 폴더>/exports/markdown/ (Obsidian 열람용)
 python3 scripts/idea_check backup       # 스냅샷 + 내보내기 + 미러 복사
 python3 scripts/idea_check integrity    # 8종 무결성 검사
 ```
@@ -458,16 +526,21 @@ python3 scripts/idea_check integrity    # 8종 무결성 검사
 ├── scripts/                            # 저장 계층
 ├── references/                         # 스키마·대화 규칙·복구 정책
 ├── evals/evals.json
-└── tests/test_clio.py
+└── tests/                              # test_clio.py · test_relocation.py
 
-~/ClioData/                             # 데이터 (영속, Dropbox 밖)
+~/.config/clio-idea-manager/data-root.json   # 위치 기록 — 지금 쓰는 데이터 폴더
+
+~/SecretaryData/services/ideas/         # 데이터 (영속, Dropbox 밖). v1.2 이하 설치는 ~/ClioData
+├── clio-root.json                      # 위치 표시 (root_id, active/retired)
 ├── config.json                         # 임계값·경로 등 운영 설정
 ├── ideas.db                            # SQLite 원본 (WAL)
 ├── attachments/ab/abcd…ef.png          # 첨부 원본 사본 (sha256 앞 2자리로 분산)
 ├── exports/                            # markdown/ · json
-└── backups/<타임스탬프>/                # 스냅샷 + redaction_manifest.json
+├── relocation/                         # 이전·복구 기록
+└── skill-prev/                         # 직전 스킬 코드 (업데이트 되돌리기용)
 
-~/Dropbox/ClioBackup/                   # 백업 산출물만 동기화
+~/SecretaryBackups/ideas/<타임스탬프>/   # 백업 (manifest.json 검증 목록) + redaction_manifest.json
+~/Dropbox/ClioBackup/                   # 백업 산출물만 동기화 (폴더가 있을 때만)
 ```
 
 > **왜 데이터를 Dropbox 밖에 두는가.** SQLite는 파일 잠금으로 동시성을 제어하는데,
@@ -813,12 +886,24 @@ Markdown은 글감당 한 파일 + `index.md`를 만든다. 원문과 정제본�
 
 | 명령 | 설명 | 옵션 |
 |---|---|---|
-| `init` | 데이터 디렉터리와 스키마 생성 (멱등) | — |
+| `where` | 지금 쓰는 데이터 폴더와 판정 근거 (쓰기 없음) | `--strict` (쓸 수 없으면 종료 코드 1) |
+| `init` | 데이터 디렉터리와 스키마 생성 (멱등) | `--pin` (위치 기록 고정), `--expect-root` |
 | `integrity` | 무결성 검사 8종 | `--strict` (문제가 있으면 종료 코드 1) |
-| `backup` | 스냅샷 + 내보내기 + 미러 복사 | `--out`, `--no-mirror` |
-| `restore-test` | 백업 복구 시험 | `--source` (필수) |
+| `backup` | 스냅샷 + 내보내기 + 검증 목록 + 미러 복사 | `--out`, `--no-mirror` |
+| `restore-test` | 백업 검증 목록 대조 + 격리 복원 + 무결성·지문 대조 | `--source` (필수), `--restore-to` |
 | `reconcile` | 채널 이력 대조용 보고 | `--since` |
 | `calibrate` | 자동 연결 임계값 조정 근거 | — |
+
+### `idea_relocate` — 데이터 폴더 이전·복구
+
+| 명령 | 설명 | 옵션 |
+|---|---|---|
+| `plan` | 미리보기: 경로·건수·쓰기 주체·옛 경로 참조·공간·권한·중단 범위·복구 방법 (쓰기 없음) | `--from`, `--to`, `--quiet-seconds`, `--no-scan` |
+| `run` | 백업 → 복사·검증 → 전환 → registry. 멈췄으면 이어서 | `--accept-source-problems`, `--replace-retired`, `--no-registry` |
+| `status` | 현재 위치, 이전 기록, 옛 위치 차단 여부, 전환 뒤 새 기록, 끝나지 않은 작업 | — |
+| `rollback` | 옛 위치로 되돌리기. 전환 뒤 새 기록이 있으면 함께 옮긴다 | `--dry-run`, `--id` |
+
+자세한 절차는 [references/relocation.md](references/relocation.md).
 
 ---
 
@@ -864,6 +949,15 @@ Markdown은 글감당 한 파일 + `index.md`를 만든다. 원문과 정제본�
 | `integrity_failed` | 무결성 검사 실패 (`--strict`) |
 | `db_error` | SQLite 오류 |
 | `storage_unavailable` | 데이터 디렉터리에 접근할 수 없다 (TC9) |
+| `root_ambiguous` | 위치 기록 없이 옛 위치와 새 기본 위치 모두에 DB가 있다. 아무것도 만들지 않았다 |
+| `root_missing` | 위치 기록이 가리키는 데이터 폴더가 없다. 빈 DB를 만들지 않았다 |
+| `root_retired` | 이전을 마친 옛 위치다. 메시지에 새 위치가 있다 |
+| `root_mismatch` / `relocation_unfinished` | 위치 표시가 기록과 다르다 / 끝나지 않은 이전의 사본이다 |
+| `root_busy` | 이전·복구가 잠금을 쥐고 있다. 저장되지 않았다 |
+| `writer_active` / `recent_writes` | 이전 중단: 다른 쓰기 주체가 있다 / 최근 쓰기가 있었다 |
+| `preflight_failed` / `rollback_refused` | 이전·복구 사전 점검 실패. 아무것도 바꾸지 않았다 |
+| `db_unrecognized` | `ideas.db`가 SQLite가 아니다 (손상 등). 빈 DB를 만들지 않았다 |
+| `internal_error` | 예상하지 못한 오류. 성공으로 간주하지 않는다 |
 
 **어떤 실패에서도 성공한 것처럼 응답하지 않는다.** 판단 계층은 `ok: true`를 받기 전에는
 `CLIO-` 번호를 출력하지 않는다(TC15).
@@ -872,10 +966,12 @@ Markdown은 글감당 한 파일 + `index.md`를 만든다. 원문과 정제본�
 
 ## 13. 설정
 
-`~/ClioData/config.json`. 파일에 없는 키는 내장 기본값을 쓴다(딕셔너리는 키 단위 병합).
+데이터 폴더의 `config.json`(`idea_check where`로 위치 확인). 파일에 없는 키는 내장 기본값을 쓴다
+(딕셔너리는 키 단위 병합).
 
 ```json
 {
+  "backup_root": "~/SecretaryBackups/ideas",
   "backup_mirror": "~/Dropbox/ClioBackup",
   "timezone": "Asia/Seoul",
   "ref_prefix": "CLIO",
@@ -898,7 +994,8 @@ Markdown은 글감당 한 파일 + `index.md`를 만든다. 원문과 정제본�
 
 | 키 | 기본값 | 의미 |
 |---|---|---|
-| `backup_mirror` | `~/Dropbox/ClioBackup` | 백업 산출물 복사 위치 (DB 원본은 두지 않는다) |
+| `backup_root` | `~/SecretaryBackups/ideas` | 백업을 만드는 위치 (데이터 폴더 밖) |
+| `backup_mirror` | `~/Dropbox/ClioBackup` | 백업 산출물 복사 위치. **폴더가 이미 있을 때만** 쓴다 (DB 원본은 두지 않는다) |
 | `timezone` | `Asia/Seoul` | 모든 시각은 ISO8601·초 단위·오프셋 포함으로 저장 |
 | `ref_prefix` / `ref_digits` | `CLIO` / `4` | 글감 번호 형식. 초과 시 자릿수 확장, 재사용 금지 |
 | `auto_link_threshold` | `1.01` | **자동 연결 비활성.** 근거 없이 낮추지 않는다 |
@@ -910,7 +1007,7 @@ Markdown은 글감당 한 파일 + `index.md`를 만든다. 원문과 정제본�
 | `search_weights` | 위 표 | 검색 신호 가중치. 합이 1이 되도록 유지한다 |
 | `state_factor` | active/inbox 1.0, archived 0.7 | 보관 상태별 점수 계수 |
 | `recency_halflife_days` | `90` | 최근성 신호의 반감기 |
-| `backup_retention` | 일 7 / 주 4 / 월 12 | rolling 보존 정책 |
+| `backup_retention` | 일 7 / 주 4 / 월 12 | rolling 보존 정책 (이 도구의 일상 백업에만 적용) |
 
 ---
 
@@ -924,18 +1021,25 @@ scripts/idea_check backup --no-mirror  # 로컬에만
 scripts/idea_check backup --out /path/to/dir
 ```
 
-- **대상** — `ideas.db` 스냅샷, JSON 전량, Markdown, `attachments/` 사본
-- **방식** — `sqlite3` 백업 API로 **온라인 스냅샷**. 실행 중인 파일을 복사하지 않는다
-- **위치** — `~/ClioData/backups/<타임스탬프>/` 생성 후 `backup_mirror`로 복사
-- **보존** — 일 7 / 주 4 / 월 12 rolling (초과분은 `pruned`로 보고)
-- **검증** — 백업 직후 건수 대조 (`"verified": true`)
+- **대상** — `ideas.db` 스냅샷, JSON 전량, Markdown, `attachments/` 사본, `config.json`
+- **방식** — `sqlite3` 백업 API로 **온라인 스냅샷**. 실행 중인 파일을 복사하지 않는다.
+  WAL에만 있는 기록도 스냅샷에 들어간다
+- **위치** — `backup_root`(기본 `~/SecretaryBackups/ideas/<타임스탬프>/`) 생성 후, `backup_mirror`
+  폴더가 **이미 있으면** 복사한다 (`mirror.status`: `mirrored` / `inactive` / `not_configured` / `failed`)
+- **검증 목록** — `manifest.json`: 도구·종류(`routine`/`relocation`/`rollback`)·표별 지문·파일별 SHA-256.
+  만든 직후 목록대로 다시 읽어 확인한다 (`"verified": true`)
+- **보존** — 일 7 / 주 4 / 월 12 rolling (초과분은 `pruned`로 보고). 이 도구의 일상 백업만 정리하고,
+  이전·복구 백업이나 다른 도구가 같은 폴더에 둔 백업은 지우지 않는다
 
-자동 스케줄링은 도구에 포함되어 있지 않다. 외부 스케줄러로 부른다.
+v1.2 이하가 `~/ClioData/backups/`에 만든 백업은 그 자리에 그대로 남는다.
+
+자동 스케줄링은 도구에 포함되어 있지 않다. 외부 스케줄러로 부른다. **`CLIO_DATA_DIR`을 붙이지
+않는다** — 위치 기록을 따라야 데이터 폴더를 옮긴 뒤에도 그대로 동작한다.
 
 ```cron
-# 매일 새벽 4시 백업, 매주 월요일 복구 시험
-0 4 * * *  CLIO_DATA_DIR=$HOME/ClioData $HOME/.claude/skills/clio-idea-manager/scripts/idea_check backup >> $HOME/ClioData/backup.log 2>&1
-0 5 * * 1  CLIO_DATA_DIR=$HOME/ClioData $HOME/.claude/skills/clio-idea-manager/scripts/idea_check integrity --strict >> $HOME/ClioData/backup.log 2>&1
+# 매일 새벽 4시 백업, 매주 월요일 무결성 검사
+0 4 * * *  $HOME/.claude/skills/clio-idea-manager/scripts/idea_check backup >> $HOME/SecretaryBackups/ideas/backup.log 2>&1
+0 5 * * 1  $HOME/.claude/skills/clio-idea-manager/scripts/idea_check integrity --strict >> $HOME/SecretaryBackups/ideas/backup.log 2>&1
 ```
 
 ### 무결성 검사 8종
@@ -966,26 +1070,33 @@ tombstone은 내용 없이 삭제 사실과 시각만 남긴다. 감사 추적�
 `ref`는 영구히 회수하지 않는다.
 
 **영구 삭제와 백업의 관계:** 기존 백업 파일은 소급 수정하지 않는다. 대신
-`backups/redaction_manifest.json`에 삭제 대상을 누적 보관하고 백업마다 갱신한다.
+백업 루트의 `redaction_manifest.json`에 삭제 대상을 누적 보관하고 백업마다 갱신한다.
 **과거 백업에서 복구할 때는 복구 직후 이 매니페스트를 다시 적용해야 한다.**
 그렇게 하지 않으면 지운 내용이 복구와 함께 되살아난다.
 
 ### 복구 절차
 
-```bash
-# 1. 백업이 온전한지 먼저 시험한다
-scripts/idea_check restore-test --source ~/ClioData/backups/<타임스탬프>
+`<데이터>`는 `idea_check where`의 `data_dir`, `<백업>`은 `backup_root`다.
 
-# 2. 현재 DB를 보존한 뒤 교체한다
-mv ~/ClioData/ideas.db ~/ClioData/ideas.db.broken
-cp ~/ClioData/backups/<타임스탬프>/ideas.db ~/ClioData/ideas.db
-cp -R ~/ClioData/backups/<타임스탬프>/attachments/ ~/ClioData/attachments/
+```bash
+# 1. 백업이 온전한지 먼저 시험한다 (검증 목록 대조 → 임시 위치 복원 → 무결성·지문)
+scripts/idea_check restore-test --source <백업>/<타임스탬프>
+#    격리 사본을 남겨 직접 열어 볼 수도 있다 (운영 정본은 그대로)
+scripts/idea_check restore-test --source <백업>/<타임스탬프> --restore-to /tmp/clio-restore
+
+# 2. Clio 명령이 돌지 않을 때, 현재 DB를 보존한 뒤 교체한다
+mv <데이터>/ideas.db <데이터>/ideas.db.broken
+[ -f <데이터>/ideas.db-wal ] && mv <데이터>/ideas.db-wal <데이터>/ideas.db.broken-wal
+rm -f <데이터>/ideas.db-shm
+cp <백업>/<타임스탬프>/ideas.db <데이터>/ideas.db
+cp -R <백업>/<타임스탬프>/attachments/ <데이터>/attachments/
 
 # 3. 검증한다
 scripts/idea_check integrity --strict
 ```
 
 건수와 무결성이 맞지 않으면 교체한 파일을 되돌리고 다른 백업을 시도한다.
+데이터 폴더 이전을 되돌리는 것은 별도 명령이다 (`idea_relocate rollback`, [§4](#데이터-폴더-옮기기)).
 
 ### 임계값을 함부로 바꾸지 않는다
 
@@ -1021,13 +1132,13 @@ scripts/idea_check calibrate
 ## 15. 테스트
 
 ```bash
-python3 tests/test_clio.py            # 30건, 격리된 임시 데이터 디렉터리에서 실제 스크립트 호출
+python3 tests/test_clio.py            # 67건 (test_relocation.py 포함), 격리된 임시 홈에서 실제 스크립트 호출
 python3 tests/test_clio.py -v         # 개별 결과
 python3 -m unittest tests.test_clio.ClioTest.test_TC19_same_day_duplicate_without_message_id
 ```
 
 ```
-Ran 30 tests in 7.787s
+Ran 67 tests in 65.548s
 
 OK
 ```
@@ -1061,6 +1172,19 @@ OK
 상세 출력의 시각 표기, 버전과 `CHANGELOG.md`의 일치, 그리고 설치·업데이트가
 데이터와 사용자 설정을 보존하는지(구버전 설치본에서의 업그레이드 포함)를 검증한다.
 
+`tests/test_relocation.py` 37건은 데이터 위치·이전·복구를 검증한다. 모두 임시 홈 폴더에서 돌고
+crontab은 가짜 명령으로 바꿔 끼우므로 실제 데이터·위치 기록·registry에 닿지 않는다.
+
+| 영역 | 검증 내용 |
+|---|---|
+| 위치 판정 | 신규 설치 → 새 기본 위치 / 구버전 설치 업데이트 → 기존 위치 유지·빈 DB 미생성 / 명시 경로 우선 / 두 위치 모두 DB → 아무것도 만들지 않고 거부 / 위치 기록이 없는 폴더·DB 없는 표시·손상된 옛 DB → 빈 DB 미생성 |
+| 미리보기 | `plan` 전후 홈 폴더 전체 파일·수정 시각 불변, 예약 작업의 옛 경로 탐지, 비밀값 미출력, 구버전 도구 차단 |
+| 이전 | 모든 기록·식별자·첨부 연결·설정 보존, 옛 위치 차단(구버전 도구 포함), registry는 `ideas`만 변경(형식이 다르면 손대지 않음), WAL에만 있는 기록 보존, 빈 DB·빈 첨부 폴더, 첨부 절대경로 보정과 과거 기록 불변, 경로가 아닌 설정값(`Asia/Seoul`·URL) 불변 |
+| 거부 | 첨부 누락·해시 불일치, 여유 공간 부족, 권한 없음, 대상 충돌, 실행 중인 쓰기(잠금·열린 파일), 동시 이전 |
+| 중단 | 단계별 강제 종료 5곳 → 재실행으로 손실·중복 없이 완료, 중단 사이 원본에 생긴 기록·설정 변경 보존, 업데이트 반복 후 새 위치 유지 |
+| 복구 | 새 기록 없음 → 원본 복원(보존본 유지, 새 위치에 빈 DB가 생기지 않음) / 새 기록 있음 → 최신 데이터와 새 첨부까지 복원, 영구 삭제한 첨부는 되살리지 않음 / 복구 중 강제 종료 3곳 × 2 → 재실행 완료, 두 위치 동시 사용 없음, 옛 위치 차단 유지 / 멈춘 사이 새 기록 → 포기 후 다시 / 코드 되돌리기 시 옛 DB 재사용 안 함 |
+| 백업 | 검증 목록·변조 탐지, 복원 시험이 백업을 바꾸지 않음(구형 백업 포함), 격리 복원 사본에서 조회·저장·첨부 열람, 미러 폴더 자동 생성 안 함, 정리는 일상 백업만 |
+
 판단 계층(`SKILL.md`)의 대화 규칙은 `evals/evals.json`의 시나리오로 회귀 검증한다.
 저장 계층 테스트가 검증할 수 없는 것(무엇을 묻고 무엇을 묻지 않는가, 실패 시 문안)이 대상이다.
 
@@ -1079,13 +1203,16 @@ scripts/
                              relate, merge, split, set-state, tag, undo, redact, delete-idea
   idea_search         읽기 — list, show, query, similar, unassigned, trace, relations
   idea_export         내보내기 — md, json
-  idea_check          운영 — init, integrity, backup, restore-test, reconcile, calibrate
+  idea_check          운영 — where, init, integrity, backup, restore-test, reconcile, calibrate
+  idea_relocate       데이터 폴더 이전·복구 — plan, run, status, rollback
+  clio_ops.py         운영 공용 — 지문, 검증 복사, 백업·복원, 쓰기 주체 탐지, registry
 references/
   schema.md           데이터 모델과 단일 원본 규칙
   conversation-rules.md  응답 문안 모음
   recovery-policy.md  삭제·백업·복구 정책
+  relocation.md       데이터 위치 판정·이전·되돌리기 절차
 evals/evals.json      판단 계층 회귀 검증 시나리오
-tests/test_clio.py    저장 계층 자동 테스트 30건
+tests/test_clio.py    저장 계층 자동 테스트 30건 (+ test_relocation.py 37건)
 ```
 
 | 단계 | 범위 | 상태 |
@@ -1094,6 +1221,7 @@ tests/test_clio.py    저장 계층 자동 테스트 30건
 | 2. 편집과 이력 | revision, 2축 상태, 태그, 재배정, undo | **완료** |
 | 3. 연결과 합성 | 관계·근거·확인 상태, merge, split, 유사 후보 | **완료** |
 | 4. 운영 안정성 | 내보내기, 온라인 스냅샷 백업, 복구 시험, 무결성 8종 | **완료** |
+| 4.1 데이터 위치 | 공통 위치 판정, 검증된 이전·재실행·되돌리기, 검증 목록 백업 | **완료** (v1.3.0) |
 | 5. 의미 검색 | 축적 데이터로 검색 품질 평가 후 조건부 임베딩 도입 | 미착수 (조건 미충족) |
 
 **알려진 미착수 항목**
@@ -1143,13 +1271,21 @@ CLI에서 직접 부르는 것은 이미 명시적 의사 표시다.
 [§14](#임계값을-함부로-바꾸지-않는다) 참조.
 
 **Q. 업데이트하면 그동안 쌓은 글감이 날아가나?**
-날아가지 않는다. 업데이트는 `~/.claude/skills/…`의 **코드만** 갱신하고 `~/ClioData/`는
-읽지도 쓰지도 않는다(스키마 보장과 무결성 검사 제외). `config.json`에서 직접 고친 임계값도
+날아가지 않는다. 업데이트는 `~/.claude/skills/…`의 **코드만** 갱신하고 데이터 폴더는
+옮기거나 지우지 않는다(스키마 보장, 위치 기록 고정, 무결성 검사 제외). `config.json`에서 직접 고친 임계값도
 유지되며, 새 버전에서 생긴 키만 기본값으로 추가된다. 이 동작은 테스트로 강제된다.
 
 **Q. 업데이트 전에 기존 설치를 지워야 하나?**
 지우면 안 된다. `./update.sh`(또는 새 사본에서 `./install.sh`)만 실행하면 제자리에서
 갱신된다. 이전 버전에만 있던 파일은 스크립트가 알아서 정리한다.
+
+**Q. v1.3.0으로 올렸는데 데이터가 아직 `~/ClioData`에 있다.**
+정상이다. 업데이트는 데이터를 옮기지 않는다. 공통 위치로 옮기려면 `idea_relocate plan`으로 미리 본 뒤
+`idea_relocate run` ([§4](#데이터-폴더-옮기기)). 옮기지 않아도 계속 동작한다.
+
+**Q. 옮긴 뒤 옛 `~/ClioData`는 지워도 되나?**
+운영이 충분히 검증된 뒤 사람이 판단한다. 도구는 지우지 않는다. 그 안의 `ideas.db`는 차단 파일이고,
+`ideas.db.relocated-<id>`가 이전 직전 원본이다. 되돌리기(`idea_relocate rollback`)는 이 보존본을 쓴다.
 
 **Q. 데이터를 다른 도구로 옮기고 싶다.**
 `idea_export json`이 전량을 하나의 JSON으로, `idea_export md`가 글감당 한 파일로 낸다.
@@ -1164,17 +1300,21 @@ v1의 범위 밖이다. DB 원본을 동기화 폴더에 두면 손상 위험이
 | 증상 | 원인 | 조치 |
 |---|---|---|
 | `no such module: fts5` | Python에 딸린 SQLite에 FTS5가 없다 | `python3 -c "import sqlite3;sqlite3.connect(':memory:').execute('CREATE VIRTUAL TABLE t USING fts5(x)')"`로 확인. 실패하면 FTS5가 켜진 Python(공식 배포판, Homebrew, `python.org` 설치본)을 쓴다 |
-| `database is locked` | 다른 프로세스가 쓰는 중이거나 DB가 동기화 폴더에 있다 | 실행 중인 프로세스를 정리한다. `~/ClioData`가 Dropbox/iCloud 안이면 밖으로 옮긴다 |
-| `storage_unavailable` | 데이터 디렉터리에 접근할 수 없다 | `CLIO_DATA_DIR` 확인, 권한 확인, `idea_check init` 재실행 |
+| `database is locked` | 다른 프로세스가 쓰는 중이거나 DB가 동기화 폴더에 있다 | 실행 중인 프로세스를 정리한다. 데이터 폴더가 Dropbox/iCloud 안이면 밖으로 옮긴다 |
+| `storage_unavailable` | 데이터 디렉터리에 접근할 수 없다 | `idea_check where`로 위치 확인, 권한 확인 |
+| `root_ambiguous` | 두 위치 모두에 DB가 있고 위치 기록이 없다 | 어느 쪽이 정본인지 확인 후 `CLIO_DATA_DIR`로 명시하거나 한쪽을 정리. 도구는 고르지 않는다 |
+| `root_missing` | 위치 기록이 가리키는 폴더가 없다 | 외장 디스크 연결·이동 여부 확인, `idea_relocate status` |
+| `root_retired` · 구버전에서 `file is not a database` | 이전을 마친 옛 위치를 쓰려 했다 | 새 위치로 바꾼다 (`idea_check where`). 예약 작업의 `CLIO_DATA_DIR`을 지운다 |
+| `root_busy` | 이전·복구 중 | 끝난 뒤 다시 실행. 그 메시지는 저장되지 않았다 |
 | `no_trigger`인데 저장하고 싶다 | `--raw-message`가 지시어를 강제한다 | 지시어를 붙이거나 `--body`를 쓴다 |
 | 스킬이 반응하지 않는다 | 설치 위치 또는 트리거 문구 | `ls ~/.claude/skills/clio-idea-manager/SKILL.md` 확인. 메시지를 `글감:`으로 시작한다 |
 | `scripts/idea_store: Permission denied` | 실행 권한이 없다 | `chmod +x scripts/idea_*` 또는 `python3 scripts/idea_store …`로 호출 |
 | 검색에 안 걸린다 | 어간 추출이 근사라 어절이 길면 놓칠 수 있다 | 짧은 명사로 질의한다("기억하는것에대해" → "기억"). 반복되면 `search_weights` 조정 검토 |
 | `SyntaxError` / `ModuleNotFoundError: zoneinfo` | Python 3.11 미만 | `python3 --version` 확인 후 3.11 이상으로 실행 |
-| 백업 미러가 비어 있다 | `backup_mirror` 경로가 없거나 `--no-mirror`를 줬다 | `config.json`의 경로를 만들고 다시 실행. 응답의 `mirrored_to`로 확인 |
-| 복구 후 지운 내용이 되살아났다 | 매니페스트 미적용 | `backups/redaction_manifest.json`을 복구 직후 다시 적용한다 |
-| 업데이트 후 동작이 이상하다 | 새 버전의 문제 | `~/ClioData/skill-prev`로 되돌린다 ([§4](#업데이트를-되돌리기)). 데이터는 영향받지 않는다 |
-| 같은 스킬이 두 개로 보인다 | v1.2.2 이전이 `~/.claude/skills/` 안에 롤백본을 남겼다 | `./install.sh`를 다시 실행하면 `~/ClioData/skill-prev`로 옮긴다 |
+| 백업 미러가 비어 있다 | `backup_mirror` 폴더가 없거나 `--no-mirror`를 줬다 | 폴더를 직접 만들고 다시 실행 (도구는 만들지 않는다). 응답의 `mirror.status`로 확인 |
+| 복구 후 지운 내용이 되살아났다 | 매니페스트 미적용 | 백업 루트의 `redaction_manifest.json`을 복구 직후 다시 적용한다 |
+| 업데이트 후 동작이 이상하다 | 새 버전의 문제 | `<데이터 폴더>/skill-prev`로 되돌린다 ([§4](#업데이트를-되돌리기)). 데이터는 영향받지 않는다 |
+| 같은 스킬이 두 개로 보인다 | v1.2.2 이전이 `~/.claude/skills/` 안에 롤백본을 남겼다 | `./install.sh`를 다시 실행하면 `<데이터 폴더>/skill-prev`로 옮긴다 |
 | `update.sh`가 로컬 변경으로 멈춘다 | 저장소에 커밋하지 않은 수정이 있다 | `git status`로 확인 후 정리(`git stash` 또는 커밋)하고 다시 실행한다 |
 | 업데이트했는데 옛 동작이 그대로다 | 낡은 `__pycache__` | 설치 스크립트가 정리하지만, 수동 실행 중이라면 `find . -name __pycache__ -exec rm -rf {} +` |
 
@@ -1187,7 +1327,7 @@ v1의 범위 밖이다. DB 원본을 동기화 폴더에 두면 손상 위험이
 형식으로 남긴다.
 
 ```bash
-scripts/idea_store --version        # clio-idea-manager 1.2.2
+scripts/idea_store --version        # clio-idea-manager 1.3.0
 scripts/idea_check integrity        # 응답 JSON에 "clio_version" 포함
 ```
 
@@ -1202,7 +1342,7 @@ scripts/idea_check integrity        # 응답 JSON에 "clio_version" 포함
 검사하므로 한쪽만 올리면 빌드가 깨진다.
 
 데이터 파일 형식의 버전은 `SCHEMA_VERSION`으로 따로 관리한다(현재 `1`).
-스킬 버전이 올라가도 스키마가 그대로면 기존 `~/ClioData`는 손대지 않는다.
+스킬 버전이 올라가도 스키마가 그대로면 기존 데이터 폴더는 손대지 않는다.
 
 **갱신 절차**
 
